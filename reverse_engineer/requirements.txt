@@ -1,0 +1,4 @@
+deepagents
+python-dotenv
+langsmith
+langchain-openai
