@@ -128,9 +128,11 @@ End with a concise summary containing:
 - This workspace file is the authoritative architecture input for the
   orchestrator's final consistency check.
 
-After the full architecture document is complete, call save_markdown_document
-once with:
-- project_name: the indexed project name supplied in the request
-- document_type: "architecture"
-- content: the complete architecture documentation in Markdown format
+After `/workspace/ARCHITECTURE.md` is written and verified, call
+`persist_workspace_document(project_name, "architecture")` once to persist
+it as the final output. This tool reads the file you already wrote directly
+from `/workspace/` and saves it — do not retype or re-summarize the document
+content yourself as a tool argument; the file on disk is already the
+complete, authoritative version, and retyping it risks producing a shortened
+or summarized copy instead of the real document.
 """

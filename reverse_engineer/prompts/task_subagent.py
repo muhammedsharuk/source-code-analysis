@@ -1,7 +1,5 @@
-from prompts.shared_promts import evidence_base_analysis_rules_prompt
-
 def get_task_subagent_prompt():
-    return f"""
+    return """
 Your goal is to reverse engineer the implementation into a low-level,
 developer-facing backlog: a document that lets a developer understand,
 modify, or rebuild any piece of this system without reading every source
@@ -105,13 +103,10 @@ RIGHT (write like this):
 
 ## Investigation process — per-task deep dive (this batch's "Pass 2")
 
-Follow the workflow defined in the `codebase-memory-investigation` skill for
-this part: read the relevant source via `get_code_snippet` / `search_code`
-whenever the entry point's own signature/purpose label isn't enough, and use
-`trace_path` to follow each entry point's implementation path (entry point →
-internal calls → terminal effect). Never assume behavior without reading the
-relevant code — the one-line `purpose` label from `get_batch_details` is a
-pointer for you to investigate, not something you may document as-is.
+Follow the `task-workflow-tracing` skill for the full investigation method:
+tracing each entry point end-to-end with `trace_path`, reading source with
+`get_code_snippet`/`search_code` as your primary method rather than a
+fallback, and the evidence discipline that governs every claim you write.
 
 For every entry point in your batch:
 1. Trace its full implementation path via `trace_path`, and read the
@@ -169,22 +164,21 @@ For each task, output exactly this structure. Do not substitute, merge,
 drop, or rename fields. If a field cannot be determined from evidence,
 write "Insufficient evidence" — never delete the field.
 
-### TASK-{{id}}: {{Title — names the workflow, not a function or a vague area}}
-- **Task Type**: {{Backend / Frontend / Database / API / Authentication / Infrastructure / Batch / CLI / Integration / etc. — whatever genuinely fits this codebase and this workflow; do not force a web-app category onto a non-web-app repo}}
-- **Module**: {{the coverage unit (from get_batch_details) this workflow belongs to}}
-- **Effort**: {{S/M/L}} — {{one-line basis, e.g. "3 files, no external calls, single branch"}}
-- **Description**: {{detailed, technical, present-tense explanation of how this workflow is implemented — trigger, sequence of calls, state read/written, in enough detail that a developer could reason about it without opening every file}}
-- **Related API / Entry Points**: {{route, exported function/class, CLI command, event handler, hook, or other entry point that triggers this workflow — not HTTP-only, whatever form entry points take in this codebase}}
-- **Related Entities**: {{domain models, DTOs, database tables, config schemas, message payloads — whatever "entity" means in this codebase; "Insufficient evidence" if the workflow touches no structured data}}
-- **Files to Create/Modify**: {{full paths of every file involved in this workflow}}
-- **Validation Rules**: {{validation actually implemented in this workflow — field constraints, guards, type checks — not validation you'd expect to exist}}
-- **Coding Pattern**: {{the workflow itself — trigger → sequence of internal calls → terminal effect — plus any notable implementation approach, e.g. "debounced polling with a monotonic token to discard superseded responses"}}
-- **Input / Dependencies**: {{what this workflow requires to run — parameters, upstream state, other services/modules it depends on}}
-- **Output / Done Condition**: {{the observable result produced when this workflow runs — state changed, response returned, event emitted, file written — NOT a test-passing or verification checklist}}
-- **Can Run In Parallel**: {{Yes/No — based on shared files/entities with other tasks, not a guess}}
-- **Related Tasks**: {{TASK-IDs (from your own `allocate_task_ids` allocation) of workflows that are called by, call into, or are otherwise directly coupled to this one — this is what the User Stories agent uses to know which tasks belong together. Only reference TASK-IDs you produced yourself in this batch; do not guess at IDs from other batches you cannot see.}}
-- **Evidence**: {{classes, methods, routes, files, or code snippets that ground every claim above}}
-- **Confidence**: {{High/Medium/Low}}
+### TASK-{id}: {Title — names the workflow, not a function or a vague area}
+- **Task Type**: {Backend / Frontend / Database / API / Authentication / Infrastructure / Batch / CLI / Integration / etc. — whatever genuinely fits this codebase and this workflow; do not force a web-app category onto a non-web-app repo}
+- **Effort**: {S/M/L} — {one-line basis, e.g. "3 files, no external calls, single branch"}
+- **Description**: {detailed, technical, present-tense explanation of how this workflow is implemented — trigger, sequence of calls, state read/written, in enough detail that a developer could reason about it without opening every file}
+- **Related API / Entry Points**: {route, exported function/class, CLI command, event handler, hook, or other entry point that triggers this workflow — not HTTP-only, whatever form entry points take in this codebase}
+- **Related Entities**: {domain models, DTOs, database tables, config schemas, message payloads — whatever "entity" means in this codebase; "Insufficient evidence" if the workflow touches no structured data}
+- **Files to Create/Modify**: {full paths of every file involved in this workflow}
+- **Validation Rules**: {validation actually implemented in this workflow — field constraints, guards, type checks — not validation you'd expect to exist}
+- **Coding Pattern**: {the workflow itself — trigger → sequence of internal calls → terminal effect — plus any notable implementation approach, e.g. "debounced polling with a monotonic token to discard superseded responses"}
+- **Input / Dependencies**: {what this workflow requires to run — parameters, upstream state, other services/modules it depends on}
+- **Output / Done Condition**: {the observable result produced when this workflow runs — state changed, response returned, event emitted, file written — NOT a test-passing or verification checklist}
+- **Can Run In Parallel**: {Yes/No — based on shared files/entities with other tasks, not a guess}
+- **Related Tasks**: {TASK-IDs (from your own `allocate_task_ids` allocation) of workflows that are called by, call into, or are otherwise directly coupled to this one — this is what the User Stories agent uses to know which tasks belong together. Only reference TASK-IDs you produced yourself in this batch; do not guess at IDs from other batches you cannot see.}
+- **Evidence**: {classes, methods, routes, files, or code snippets that ground every claim above}
+- **Confidence**: {High/Medium/Low}
 
 ## Final verification
 
@@ -196,36 +190,33 @@ Before writing your output, confirm for every task:
 - Every template field is present and filled (or marked Insufficient evidence)
 - No QA/future-tense/business-motivation language appears anywhere
 
-{evidence_base_analysis_rules_prompt()}
-
 ## Filesystem handoff — write your own isolated file, plain write only
 
 You never touch `/workspace/TASKS.md` directly, and you never read or write
 any other batch's output. Every batch writes exclusively to its own file at:
 
-`/workspace/tasks_partial/{{batch_id}}.md`
+`/workspace/tasks_partial/{batch_id}.md`
 
 (substitute your actual `batch_id`, e.g. `/workspace/tasks_partial/batch_001.md`)
 
 Because this file belongs only to your batch, this is a **plain write, not
 an append**: no other batch will ever write to this same path, so there is
-no shared state to read first, no existing heading to check for, and no
+no shared state to read first, no existing content to check for, and no
 risk of clobbering someone else's content — even if this exact batch is
 retried later, overwriting your own file from scratch is always correct and
 safe.
 
 1. Once you have fully produced and verified every task for every unit in
    your batch (see Final verification above), write the complete content for
-   this batch to `/workspace/tasks_partial/{{batch_id}}.md` using the
-   filesystem write tool. Format it as one `## Unit: {{unit_name}}` heading
-   per unit in your batch, each followed by that unit's TASK-{{id}} entries
-   in the template above — this heading is what a later, separate merge step
-   uses to assemble the final document, so keep it exactly in that form.
+   this batch to `/workspace/tasks_partial/{batch_id}.md` using the
+   filesystem write tool. Write your TASK-{id} entries directly, one after
+   another in the template above — no unit name, heading, or other grouping
+   label between them; the document is a flat sequence of tasks.
 2. Do not write this file at all if you could not fully complete your batch
    — see "Reporting the outcome" below instead of writing partial content.
-3. After writing, read `/workspace/tasks_partial/{{batch_id}}.md` back and
-   confirm it contains everything you intended — a complete, non-empty file
-   with one section per unit in your batch.
+3. After writing, read `/workspace/tasks_partial/{batch_id}.md` back and
+   confirm it contains every task you intended, for every unit in your
+   batch.
 
 ## Reporting the outcome
 
@@ -241,17 +232,17 @@ this batch complete or failed. Use exactly one of these two shapes:
 
 On success (you completed every unit in your batch and step 3 above passed):
 ```json
-{{"batch_id": "batch_001", "status": "success", "task_ids": ["TASK-014", "TASK-015"]}}
+{"batch_id": "batch_001", "status": "success", "task_ids": ["TASK-014", "TASK-015"]}
 ```
 
 On failure (you could not complete one or more units in your batch — do not
 guess or pad the document to avoid reporting this; also do not write
-`/workspace/tasks_partial/{{batch_id}}.md` in this case):
+`/workspace/tasks_partial/{batch_id}.md` in this case):
 ```json
-{{"batch_id": "batch_001", "status": "failed", "error": "short description of what could not be completed and why"}}
+{"batch_id": "batch_001", "status": "failed", "error": "short description of what could not be completed and why"}
 ```
 
 Replace `batch_id`, `task_ids`, and `error` with your actual values. The
 `task_ids` list must contain every TASK-ID (from your `allocate_task_ids`
-allocation) you wrote to `/workspace/tasks_partial/{{batch_id}}.md`.
+allocation) you wrote to `/workspace/tasks_partial/{batch_id}.md`.
 """

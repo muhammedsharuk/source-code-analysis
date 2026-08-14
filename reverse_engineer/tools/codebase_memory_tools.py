@@ -7,9 +7,11 @@ See https://docs.langchain.com/oss/python/deepagents/tools
 from typing import Any, Literal
 
 from utils.codebase_memory import CodebaseMemoryCLI
+from utils.tool_safety import tool_safe
 
 _cli = CodebaseMemoryCLI()
 
+@tool_safe
 def index_repository(
     repo_path: str,
     mode: str = "full",
@@ -26,27 +28,20 @@ def index_repository(
 #     """Delete a project from the knowledge graph."""
 #     return _cli.delete_project(project=project)
 
+@tool_safe
 def index_status(
     project: str,
 ):
     """Get indexing status for a project."""
     return _cli.index_status(project=project)
 
-def check_index_coverage(
-    project: str,
-    paths: list[str] | None = None,
-    scopes: list[str] | None = None,
-    scope_limit: int = 200,
-    scope_offset: int = 0,
-):
-    """Check indexing coverage for a project."""
-    return _cli.check_index_coverage(project=project, paths=paths, scopes=scopes, scope_limit=scope_limit, scope_offset=scope_offset)
-
+@tool_safe
 def list_projects() -> Any:
     """List all indexed codebase-memory projects and their root paths."""
     return _cli.list_projects()
 
 
+@tool_safe
 def get_architecture(
     project: str,
     path: str | None = None,
@@ -62,6 +57,7 @@ def get_architecture(
     return _cli.get_architecture(project=project, path=path, aspects=aspects)
 
 
+@tool_safe
 def search_graph(
     project: str,
     query: str | None = None,
@@ -120,6 +116,7 @@ def search_graph(
     )
 
 
+@tool_safe
 def trace_path(
     project: str,
     function_name: str,
@@ -160,6 +157,7 @@ def trace_path(
     )
 
 
+@tool_safe
 def query_graph(
     project: str,
     query: str,
@@ -182,6 +180,7 @@ def query_graph(
     )
 
 
+@tool_safe
 def get_graph_schema(project: str) -> Any:
     """Get the schema (node labels, edge types, properties) for a project graph.
 
@@ -191,6 +190,7 @@ def get_graph_schema(project: str) -> Any:
     return _cli.get_graph_schema(project=project)
 
 
+@tool_safe
 def get_code_snippet(
     project: str,
     qualified_name: str,
@@ -210,6 +210,7 @@ def get_code_snippet(
     )
 
 
+@tool_safe
 def search_code(
     project: str,
     pattern: str,
@@ -244,6 +245,7 @@ def search_code(
     )
 
 
+@tool_safe
 def detect_changes(
     project: str,
     scope: str | None = None,
@@ -269,6 +271,7 @@ def detect_changes(
     )
 
 
+@tool_safe
 def manage_adr(
     project: str,
     mode: Literal["get", "set", "update"] = "get",
@@ -291,6 +294,7 @@ def manage_adr(
     )
 
 
+@tool_safe
 def ingest_traces(
     project: str,
     traces: list[dict],
@@ -308,7 +312,6 @@ CODEBASE_MEMORY_TOOLS = [
     index_repository,
     # delete_project,
     index_status,
-    check_index_coverage,
     list_projects,
     get_architecture,
     search_graph,

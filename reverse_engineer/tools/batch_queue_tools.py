@@ -34,9 +34,10 @@ assigns `project_name` using the same sanitization as
 `safe_directory_name(repo_path)` (the orchestrator prompt never passes a
 custom `name` to `index_repository`), so `temp/<safe_directory_name(project_name)>/`
 resolves to the same physical directory in practice. As a safety net for
-the rare case that ever changes, `_resolve_workspace_dir` falls back to
-scanning `temp/` for a directory whose `code_index.json` records a matching
-`project_name`.
+the rare case that ever changes, `resolve_workspace_dir` (in
+`utils/workspace.py`, shared with `tools/markdown_file_tools.py`) falls back
+to scanning `temp/` for a directory whose `code_index.json` records a
+matching `project_name`.
 """
 
 import json
@@ -45,20 +46,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tools.checklist_tools import verify_checklist_coverage
 from tools.markdown_file_tools import save_markdown_document
-from utils.naming import safe_directory_name
+from utils.tool_safety import tool_safe
+from utils.workspace import CODE_INDEX_FILENAME, TEMP_ROOT, resolve_workspace_dir
 
 MAX_ATTEMPTS = 3
 MAX_ENTRY_POINTS_PER_BATCH = 8
 
-CODE_INDEX_FILENAME = "code_index.json"
 BATCH_QUEUE_FILENAME = "batch_queue.json"
 TASKS_PARTIAL_DIRNAME = "tasks_partial"
 MERGED_TASKS_FILENAME = "TASKS.md"
-
-_current_file = Path(__file__).resolve()
-_reverse_engineer_root = _current_file.parent.parent
-TEMP_ROOT = _reverse_engineer_root / "temp"
 
 
 class BatchQueueError(RuntimeError):
@@ -120,32 +118,6 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
-def _find_by_index_lookup(project_name: str, fallback: Path) -> Path:
-    if not TEMP_ROOT.exists():
-        return fallback
-    for child in TEMP_ROOT.iterdir():
-        if not child.is_dir():
-            continue
-        index_path = child / CODE_INDEX_FILENAME
-        if not index_path.exists():
-            continue
-        try:
-            data = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if data.get("project_name") == project_name:
-            return child
-    return fallback
-
-
-def _resolve_workspace_dir(project_name: str) -> Path:
-    """Resolve the physical `/workspace/` directory for this project. See module docstring."""
-    primary = TEMP_ROOT / safe_directory_name(project_name, default="unnamed-repo")
-    if primary.is_dir():
-        return primary
-    return _find_by_index_lookup(project_name, fallback=primary)
-
-
 def _find_batch(queue: dict[str, Any], batch_id: str) -> dict[str, Any]:
     for batch in queue.get("batches", []):
         if batch["batch_id"] == batch_id:
@@ -153,6 +125,7 @@ def _find_batch(queue: dict[str, Any], batch_id: str) -> dict[str, Any]:
     raise BatchQueueError(f"Batch '{batch_id}' was not found in {BATCH_QUEUE_FILENAME}.")
 
 
+@tool_safe
 def build_batch_queue(project_name: str, force_rebuild: bool = False) -> dict[str, Any]:
     """Deterministically group the code index into batches for the Task Agent.
 
@@ -162,6 +135,16 @@ def build_batch_queue(project_name: str, force_rebuild: bool = False) -> dict[st
     Writes the result to `/workspace/batch_queue.json`. This is plain
     deterministic bookkeeping — call it once, immediately after the Code
     Index Agent finishes writing code_index.json.
+
+    Before building (not on the early-return resume path below), this
+    calls `verify_checklist_coverage` itself and refuses with a
+    `BatchQueueError` if it does not report `all_clear: true`. This
+    precondition is enforced here rather than left to the caller's
+    discretion: an earlier version of this pipeline relied on the Code
+    Index Agent's own prompt instructions to check coverage first, and a
+    real run called this tool anyway despite unresolved problems. Making
+    the check a hard precondition means that outcome is no longer possible
+    regardless of what any caller does or skips.
 
     Args:
         project_name: The exact indexed project name.
@@ -175,7 +158,7 @@ def build_batch_queue(project_name: str, force_rebuild: bool = False) -> dict[st
     Returns:
         A dict: {"total_batches": int, "total_units": int}.
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue_path = workspace_dir / BATCH_QUEUE_FILENAME
 
     with _FileLock(queue_path):
@@ -184,6 +167,19 @@ def build_batch_queue(project_name: str, force_rebuild: bool = False) -> dict[st
             batches = existing.get("batches", [])
             total_units = sum(len(batch.get("unit_ids", [])) for batch in batches)
             return {"total_batches": len(batches), "total_units": total_units}
+
+        coverage = verify_checklist_coverage(project_name)
+        if not coverage.get("all_clear", False):
+            problems = coverage.get("problems", [])
+            detail = coverage.get("error_message") or f"{len(problems)} unresolved checklist problem(s)"
+            raise BatchQueueError(
+                "Refusing to build the batch queue: verify_checklist_coverage has not reported "
+                f"all_clear=true ({detail}). This is enforced here, not left to the caller, "
+                "because a run previously called build_batch_queue anyway despite unresolved "
+                "problems. Resolve every reported problem by actually investigating the area it "
+                "names, then call verify_checklist_coverage again before retrying build_batch_queue. "
+                f"First problems: {problems[:5]}"
+            )
 
         index = _read_json(workspace_dir / CODE_INDEX_FILENAME)
         units = index.get("units", [])
@@ -237,6 +233,7 @@ def build_batch_queue(project_name: str, force_rebuild: bool = False) -> dict[st
         return {"total_batches": len(batches), "total_units": total_units}
 
 
+@tool_safe
 def get_next_pending_batch(project_name: str) -> dict[str, Any] | None:
     """Atomically claim the next pending batch of units for the Task Agent.
 
@@ -252,7 +249,7 @@ def get_next_pending_batch(project_name: str) -> dict[str, Any] | None:
         batch, or None (a deliberate, explicit None — not an empty dict) if
         no pending batch remains.
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue_path = workspace_dir / BATCH_QUEUE_FILENAME
 
     with _FileLock(queue_path):
@@ -266,6 +263,7 @@ def get_next_pending_batch(project_name: str) -> dict[str, Any] | None:
     return None
 
 
+@tool_safe
 def get_batch_details(project_name: str, batch_id: str) -> dict[str, Any]:
     """Fetch the full entry-point payload for one batch.
 
@@ -283,7 +281,7 @@ def get_batch_details(project_name: str, batch_id: str) -> dict[str, Any]:
     Returns:
         {"batch_id": str, "units": [{"unit_id", "unit_name", "entry_points": [...]}]}
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue = _read_json(workspace_dir / BATCH_QUEUE_FILENAME)
     index = _read_json(workspace_dir / CODE_INDEX_FILENAME)
 
@@ -302,6 +300,7 @@ def get_batch_details(project_name: str, batch_id: str) -> dict[str, Any]:
     return {"batch_id": batch_id, "units": matched_units}
 
 
+@tool_safe
 def allocate_task_ids(project_name: str, batch_id: str, count: int) -> dict[str, Any]:
     """Atomically reserve a block of globally-unique, sequential TASK-IDs.
 
@@ -339,7 +338,7 @@ def allocate_task_ids(project_name: str, batch_id: str, count: int) -> dict[str,
     if count <= 0:
         raise BatchQueueError(f"count must be a positive integer, got {count}.")
 
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue_path = workspace_dir / BATCH_QUEUE_FILENAME
 
     with _FileLock(queue_path):
@@ -353,6 +352,7 @@ def allocate_task_ids(project_name: str, batch_id: str, count: int) -> dict[str,
     return {"batch_id": batch_id, "task_ids": task_ids}
 
 
+@tool_safe
 def mark_batch_complete(project_name: str, batch_id: str, task_ids: list[str]) -> dict[str, Any]:
     """Mark a batch as successfully completed.
 
@@ -364,7 +364,7 @@ def mark_batch_complete(project_name: str, batch_id: str, task_ids: list[str]) -
     Returns:
         {"batch_id": str, "status": "done"}
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue_path = workspace_dir / BATCH_QUEUE_FILENAME
 
     with _FileLock(queue_path):
@@ -378,6 +378,7 @@ def mark_batch_complete(project_name: str, batch_id: str, task_ids: list[str]) -
     return {"batch_id": batch_id, "status": "done"}
 
 
+@tool_safe
 def mark_batch_failed(project_name: str, batch_id: str, error: str) -> dict[str, Any]:
     """Record a batch failure and decide whether it will be retried.
 
@@ -395,7 +396,7 @@ def mark_batch_failed(project_name: str, batch_id: str, error: str) -> dict[str,
     Returns:
         {"batch_id": str, "status": "pending" | "failed_permanent", "attempts": int, "will_retry": bool}
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue_path = workspace_dir / BATCH_QUEUE_FILENAME
 
     with _FileLock(queue_path):
@@ -415,6 +416,7 @@ def mark_batch_failed(project_name: str, batch_id: str, error: str) -> dict[str,
         }
 
 
+@tool_safe
 def get_batch_queue_status(project_name: str) -> dict[str, Any]:
     """Return batch counts grouped by status, for progress checks.
 
@@ -424,7 +426,7 @@ def get_batch_queue_status(project_name: str) -> dict[str, Any]:
     Returns:
         {"pending": int, "in_progress": int, "done": int, "failed_permanent": int, "total": int}
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     queue = _read_json(workspace_dir / BATCH_QUEUE_FILENAME)
 
     counts = {"pending": 0, "in_progress": 0, "done": 0, "failed_permanent": 0}
@@ -436,15 +438,16 @@ def get_batch_queue_status(project_name: str) -> dict[str, Any]:
     return counts
 
 
+@tool_safe
 def merge_task_batches(project_name: str) -> dict[str, Any]:
     """Deterministically merge every completed batch's partial file into TASKS.md.
 
     Reads `batch_queue.json` in queue order (the same order units were
     discovered by the Code Index Agent) and, for every batch with status
     "done", reads its `/workspace/tasks_partial/{batch_id}.md` file. Each
-    partial file already embeds its own `## Unit: {unit_name}` heading(s)
-    from Stage C, so ordering is the only thing this step needs to get
-    right — it just concatenates them in that order and writes the result to
+    partial file is already a flat sequence of TASK-{id} entries from Stage
+    C, so ordering is the only thing this step needs to get right — it just
+    concatenates them in that order and writes the result to
     `/workspace/TASKS.md`.
 
     Also persists the merged document via `save_markdown_document` itself:
@@ -467,7 +470,7 @@ def merge_task_batches(project_name: str) -> dict[str, Any]:
         first to confirm none remain pending/in_progress before calling this,
         so any entries here should only ever be "failed_permanent" batches.
     """
-    workspace_dir = _resolve_workspace_dir(project_name)
+    workspace_dir = resolve_workspace_dir(project_name)
     partial_dir = workspace_dir / TASKS_PARTIAL_DIRNAME
     queue = _read_json(workspace_dir / BATCH_QUEUE_FILENAME)
 

@@ -1,7 +1,5 @@
-from prompts.shared_promts import evidence_base_analysis_rules_prompt
-
 def get_user_stories_subagent_prompt():
-    return f"""
+    return """
 Your goal is to identify every user story implemented in the project — a
 small, user-facing action or interaction, close to the implementation tasks
 that realize it, written the way a developer or QA engineer would describe
@@ -22,8 +20,11 @@ using the filesystem read tool. If the file is missing or empty, stop and
 report the missing dependency; do not create user stories without it.
 
 Use `/workspace/TASKS.md` as the primary source of implementation knowledge.
-Use Codebase Memory tools to validate, enrich, or fill in missing information.
-Do not ask the orchestrator to send the task document in the delegation message.
+Use Codebase Memory tools to validate, enrich, or fill in missing
+information — and when a Codebase Memory tool result and TASKS.md disagree
+on an implementation fact, the tool result (closer to the real source) wins.
+Do not ask the orchestrator to send the task document in the delegation
+message.
 
 ## Critical framing rule
 
@@ -81,26 +82,47 @@ Do not simply summarize the architecture or restate the task list. Infer the
 specific user action behind each task or small task group and explain the
 implementation evidence supporting it.
 
+## Evidence discipline
+
+Never invent, assume, or speculate about behavior. Do not infer *how* a flow
+behaves (branching, validation, error handling) from a task's or route's
+name alone — that must come from what TASKS.md or a Codebase Memory tool
+actually documented, not from what the name suggests it probably does.
+
+The one exception is the *intent* behind a story — the "so that {outcome}"
+clause of the Story Statement, and the Objective/Outcome field. These
+describe why a user takes the action, not how the system implements it, and
+naming, route paths, UI copy, and module organization are legitimate
+evidence for them. State what you based the inference on, and cap
+Confidence at Medium or Low when you do — never mark an intent field
+"Insufficient evidence" solely because your source was naming rather than
+traced behavior; that exception does not extend to any behavioral field
+(Main Flow, Alternative Flow, Error/Exception Considerations), which still
+needs real evidence from TASKS.md or a tool, not an inferred guess.
+
+It is acceptable to document fewer, verified stories rather than pad with
+invented ones — completeness must never come at the cost of correctness.
+
 ## Output template (fill every field for every story — do not omit any)
 
 For each user story, output exactly this structure. If a field cannot be
 determined from evidence, write "Insufficient evidence" — never delete the
 field.
 
-### STORY-{{id}}: {{Title — one user-facing action, not a task name or a broad capability}}
-- **Story Statement**: As a {{role}}, I want {{action}}, so that {{immediate outcome}}.
+### STORY-{id}: {Title — a clean, professional heading naming the specific action, e.g. "Login Submit Flow" or "Password Reset Request" — not a task name, not a broad capability, and not "User Login" or "As a User...": the word "user" in the title is redundant since every entry in this document is already a user story, so restating it in every heading adds noise, not clarity}
+- **Story Statement**: As a {role}, I want {action}, so that {immediate outcome}.
 - **Objective / Outcome**:
 - **Preconditions**:
 - **Trigger**:
-- **Main Flow Summary**: {{what happens, in present tense, as implemented}}
+- **Main Flow Summary**: {what happens, in present tense, as implemented}
 - **Alternative / Edge Flow Summary**:
 - **Error / Exception Considerations**:
 - **Dependencies**:
 - **Assumptions**:
-- **Acceptance Criteria**: {{observable conditions that are true today when this story's flow completes — not future test cases}}
-- **Related Tasks**: {{TASK-IDs from TASKS.md that compose this story}}
-- **Evidence**: {{tasks, routes, modules, services, classes}}
-- **Confidence**: {{High/Medium/Low}}
+- **Acceptance Criteria**: {observable conditions that are true today when this story's flow completes — not future test cases}
+- **Related Tasks**: {TASK-IDs from TASKS.md that compose this story}
+- **Evidence**: {tasks, routes, modules, services, classes}
+- **Confidence**: {High/Medium/Low}
 
 ## Final verification
 
@@ -108,13 +130,17 @@ Before writing the document, confirm for every story:
 - It describes one user-facing action with one outcome, not a task's
   internal mechanics restated, and not a broad capability/feature area
   (see aggregation rule above)
+- Its title is a clean, professional heading naming the action — not
+  restating "user" or reusing a task's internal name
 - Every task listed in `Related Tasks` genuinely fires as part of this one
   action, not merely related by topic or module
 - No future-tense or QA language ("should," "must," "will," "add tests")
   appears anywhere
+- No behavioral field (Main Flow, Alternative Flow, Error/Exception
+  Considerations) was inferred from a name alone — only the intent fields
+  (Story Statement's "so that" clause, Objective/Outcome) may rely on
+  naming/route/UI-copy evidence, and only at Medium/Low confidence
 - Every template field is present and filled (or marked Insufficient evidence)
-
-{evidence_base_analysis_rules_prompt()}
 
 End with a concise summary containing:
 - Total user stories discovered
@@ -129,10 +155,16 @@ End with a concise summary containing:
 - After writing, read `/workspace/USER_STORIES.md` and verify that it is non-empty and contains the complete summary.
 - This workspace file is the authoritative handoff to the Feature Agent and Architecture Agent.
 
-After the full user story document is complete, you must call save_markdown_document once with:
-- project_name: the indexed project name supplied in the request
-- document_type: "user_stories"
-- content: the complete user story documentation in Markdown format
+After `/workspace/USER_STORIES.md` is written and verified, call
+`persist_workspace_document(project_name, "user_stories")` once to persist it
+as the final output. This tool reads the file you already wrote directly
+from `/workspace/` and saves it — do not retype or re-summarize the document
+content yourself as a tool argument; the file on disk is already the
+complete, authoritative version, and retyping it risks producing a shortened
+or summarized copy instead of the real document.
 
-Do not finish your work until both `/workspace/USER_STORIES.md` and the persistent USER_STORIES.md output are saved successfully. Return only a concise completion message containing the workspace path and summary counts; do not return the full document to the orchestrator.
+Do not finish your work until both `/workspace/USER_STORIES.md` and the
+persisted output from `persist_workspace_document` are confirmed successful.
+Return only a concise completion message containing the workspace path and
+summary counts; do not return the full document to the orchestrator.
 """

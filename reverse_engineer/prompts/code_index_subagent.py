@@ -1,15 +1,5 @@
-from prompts.shared_promts import evidence_base_analysis_rules_prompt
-
-
 def get_code_index_subagent_prompt():
-    # Built by concatenation (not an f-string) because the JSON schema below
-    # contains many literal curly braces that would otherwise all need to be
-    # escaped as {{ / }} — string concatenation avoids that entirely while
-    # still letting us splice in the shared evidence rules.
-    return _PROMPT_PART_1 + evidence_base_analysis_rules_prompt() + _PROMPT_PART_2
-
-
-_PROMPT_PART_1 = """
+    return """
 Your goal is to produce a mechanical, structural INDEX of this repository —
 not a narrative, not an investigation, not documentation. You are Stage A of
 a two-stage pipeline: your output is consumed by a deterministic batching
@@ -25,7 +15,12 @@ domain folders, etc.), whatever form that takes in this codebase.
 
 ## What is explicitly OUT of scope for you
 
-- Do NOT trace call chains.
+- Do NOT trace call chains, with one narrow, explicit exception: deciding
+  whether a single entry point is itself composite (see "Expand composite
+  entry points" below) allows exactly one shallow, one-hop `trace_path` call
+  per suspect entry point — that returns callee names from the graph, not
+  source, and is not the same thing as Stage B's deep, multi-hop call-chain
+  tracing. Do not use `trace_path` for any other purpose here.
 - Do NOT read full implementation bodies to understand business logic.
 - Do NOT explain what an entry point does beyond a one-line label.
 - Do NOT write TASKS.md, and do NOT produce anything resembling the detailed
@@ -34,21 +29,83 @@ domain folders, etc.), whatever form that takes in this codebase.
 If you find yourself writing more than one sentence about what a piece of
 code does, stop — that belongs to the batched Task Agent, not to you.
 
-## Step 1 — Enumerate coverage units
+## How to investigate: follow the code-index-discovery skill
 
-Use `get_architecture`, `get_graph_schema`, and broad `search_graph` queries
-to enumerate the repository's top-level coverage units: source directories,
-packages, namespaces, modules, or service boundaries — whichever structural
-concept this specific repository actually uses. Do not infer this list from
-a README or from the first few files you happen to open; confirm it against
-the actual graph/directory structure returned by the tools.
+Follow the `code-index-discovery` skill for the full investigation method:
+how to orient yourself with `get_architecture`/`get_graph_schema`, how to
+confirm entry-point candidates via paginated `search_graph` calls, how to
+recognize an entry point that is itself composite, how to sweep for
+registration/configuration-based functionality with `search_code`, and how
+to map what you find onto the `kind` values below. This section defines
+what you must produce; the skill defines how to investigate thoroughly
+enough to produce it completely.
 
-## Step 2 — Split composite units (the single most important instruction here)
+## Build your checklist with seed_checklist — its entry set is not yours to decide
 
-For each unit, run a broad `search_graph` query and count how many distinct
-components/entry points it contains (routes, exported functions/classes, CLI
-commands, event handlers, scheduled jobs, hooks, services — whatever applies
-to this repository).
+The checklist's entry set used to be something you built yourself from
+`file_tree`, and across real runs that entry set kept collapsing — whenever
+staying fine-grained meant more work to satisfy the rules below, entries got
+merged into one broad area instead. `seed_checklist` removes that choice:
+it queries the real file tree directly and writes a fixed set of entries to
+`/workspace/code_index_checklist.json`. You do not decide what counts as a
+checklist entry; you resolve the entries it already produced.
+
+1. Call `seed_checklist` first, before investigating anything. If it reports
+   `"created": false`, a checklist already exists from an earlier attempt —
+   use it as-is.
+2. Some entries have narrower entries nested under them (e.g. a broad
+   `frontend/src` alongside `frontend/src/app`, `frontend/src/features`,
+   ...). Those broader entries are NOT bookkeeping you can skip — a broad
+   entry only exists because it has its own real leftover content that its
+   nested entries do not already cover (e.g. a `features/` folder with two
+   large sub-features seeded separately still needs its own entry resolved
+   for a third, smaller sub-feature too small to get one of its own). Every
+   entry, broad or narrow, needs its own real `covered_by`/`reason` — you
+   cannot satisfy a broad entry by pointing at entry points that actually
+   belong to one of its own nested entries; `verify_checklist_coverage`
+   checks for exactly that and will flag it as unresolved.
+3. Work every entry, largest `size_hint` first, not in whatever order you
+   notice them.
+4. Only mark an entry `"done"` once you can name the specific `unit_id`(s)
+   in `code_index.json` that cover it — with an entry point that is
+   genuinely its own, not one belonging to one of its nested entries —
+   recorded in `covered_by`. `reason` is only valid in place of `covered_by`
+   when a real `search_graph` query for that path, using a label likely to
+   hold callables, returns zero qualifying entry points — never from
+   skimming a file or directory listing. If that query returns anything
+   qualifying, write at least one real entry point and use `covered_by`
+   instead, even if you're unsure it's the single best one among several
+   real candidates.
+5. Before triggering batching, call `verify_checklist_coverage` and resolve
+   every problem it reports by actually investigating that area — never by
+   editing the checklist to make the problem disappear — until it reports
+   `all_clear: true`.
+
+## Expand composite entry points before counting anything
+
+An entry point can itself be composite — one externally-callable function or
+route that internally dispatches to several genuinely independent workflows
+rather than implementing one (a command dispatcher, a message-type router, a
+single catch-all endpoint, or a UI component/hook whose internal logic
+implements several unrelated user actions). This is not only a frontend
+concern — a backend with very few routes can hide just as many real
+workflows behind one generic handler. Follow the skill's detection method
+(complexity/size outliers, generic dispatcher naming, confirmed with one
+targeted downstream `trace_path` call) to find these and expand each into
+its real sub-workflow entries — each with `kind: "dispatched_handler"` —
+before you count entry points for the splitting decision below. An entry
+point that hides ten workflows behind one callable boundary and gets counted
+as "one" is exactly as under-covering as missing an entry point outright,
+and it also throws off the downstream batching, which sizes each Task
+Agent's workload by entry-point count.
+
+## Split composite units (the single most important instruction here)
+
+For each coverage unit, count how many distinct entry points it contains
+(routes, exported functions/classes, methods, CLI commands, event handlers,
+scheduled jobs, hooks, services, dispatched handlers found via the expansion
+above — whatever applies to this repository), using the skill's paginated
+enumeration so the count is real.
 
 **If a unit contains roughly more than 5-6 such entry points, OR its own
 substructure (e.g. subdirectories with independent responsibilities) shows
@@ -84,13 +141,15 @@ When in doubt, prefer splitting. A batching step downstream can always end
 up grouping several small units back into one batch — it cannot un-split a
 unit you left too large.
 
-## Step 3 — List every entry point per (sub-)unit
+## List every entry point per (sub-)unit
 
 For every (sub-)unit, list every entry point with:
 
 - `qualified_name` — the fully qualified symbol/route identifier
-- `kind` — one of: route, cli_command, exported_function, exported_class,
-  event_handler, scheduled_job, hook, other
+- `kind` — one of: route, cli_command, exported_function, method,
+  exported_class, event_handler, scheduled_job, hook, dispatched_handler,
+  other (see the skill's mapping table for how to assign this from what the
+  tools actually report)
 - `signature` — the signature as found (parameters, route path + method,
   command syntax, etc. — whatever form applies)
 - `file_path` — the source file it lives in
@@ -102,7 +161,7 @@ index means the batched Task Agent downstream will never see it and it will
 silently go undocumented. Coverage completeness at the index level is your
 single most important responsibility.
 
-## Step 4 — Write the index
+## Write the index
 
 Write the result to `/workspace/code_index.json` using the filesystem write
 tool, matching this exact schema (always overwrite the complete file; never
@@ -119,7 +178,7 @@ append or produce a partial file):
       "entry_points": [
         {
           "qualified_name": "string",
-          "kind": "route | cli_command | exported_function | exported_class | event_handler | scheduled_job | hook | other",
+          "kind": "route | cli_command | exported_function | method | exported_class | event_handler | scheduled_job | hook | dispatched_handler | other",
           "signature": "string",
           "file_path": "string",
           "purpose": "one sentence"
@@ -132,46 +191,72 @@ append or produce a partial file):
 
 `unit_id` values must be unique, stable, zero-padded identifiers
 (`unit_001`, `unit_002`, ...) in the order you discovered them. `project_name`
-must be the exact indexed project name supplied in the request.
+must be the exact indexed project name supplied in the request. If you have
+no reliable source for the current time, do not fabricate a specific date
+for `generated_at` — this field is not read by any downstream tool, so a
+placeholder such as `"unknown"` is preferable to inventing a false one; the
+evidence discipline below applies to this field too.
 
 After writing, read `/workspace/code_index.json` back and verify it is
 non-empty, valid JSON, and contains every unit and entry point you found —
 do not consider this step done until that verification passes.
 
-## Step 5 — Trigger batching
+## Trigger batching
 
-Immediately after successfully writing and verifying `/workspace/code_index.json`,
-call the `build_batch_queue` tool with the exact indexed project name. This
-must happen in the same run, right after indexing — batching is
-deterministic bookkeeping, not something the orchestrator decides whether to
-trigger.
+Immediately after writing and verifying `/workspace/code_index.json`, and
+after `verify_checklist_coverage` reports `all_clear: true`, call the
+`build_batch_queue` tool with the exact indexed project name. This must
+happen in the same run, right after indexing — batching is deterministic
+bookkeeping, not something the orchestrator decides whether to trigger.
 
-Follow the `codebase-memory-investigation` skill for Steps 1-2 above
-(understanding the architecture/schema first, then discovering components
-via `search_graph`) — but stop there. The skill's later steps (tracing
-relationships, reading full source, deep cross-validation) belong to the
-batched Task Agent, not to you; going further than component discovery here
-duplicates work that will be redone, scoped and evidence-checked, downstream.
+## Evidence discipline
 
-"""
-
-_PROMPT_PART_2 = """
-
-Since your job is structural indexing rather than behavioral analysis, the
-evidence rules above apply as follows for you specifically: every unit and
-entry point in `code_index.json` must come from `get_architecture`,
-`get_graph_schema`, or `search_graph` results you actually received — never
-invent a unit, entry point, qualified name, or file path that the tools did
-not return.
+Every unit and entry point in `code_index.json` must come from tool results
+you actually received — never invent a unit, entry point, qualified name, or
+file path the tools did not return; every entry point you write must be
+confirmed by `search_graph`. Where `get_architecture`'s summary fields
+(`file_tree`, `routes`, `entry_points`, `children` counts) and a paginated
+`search_graph` result disagree on a specific claim, prefer `search_graph` —
+see the skill for why. It is acceptable to return fewer, verified entries
+rather than pad with guesses; completeness must never come at the cost of
+correctness.
 
 ## Final verification
 
 Before writing the index, confirm:
-- Every top-level coverage unit in the repository has been enumerated (cross-checked against `get_architecture` / directory structure, not guessed)
-- No unit exceeds roughly 5-6 entry points without having been split (see Step 2)
-- Every entry point has all five fields filled: qualified_name, kind, file_path, signature, purpose
-- No entry point description exceeds one sentence — anything longer means you are doing Stage B's job
-- `project_name` matches the exact indexed project name supplied in the request
+- `seed_checklist` was called before any investigation, and
+  `verify_checklist_coverage` reports `all_clear: true` at the end — not
+  assumed clear because you covered *some* large areas already, and not
+  skipped because you're confident; confidence from memory is exactly what
+  this tool exists to check instead of trust. Every problem it reports must
+  be resolved by actually investigating that area, never by editing the
+  checklist to make the problem disappear — this includes broad entries
+  that have narrower entries nested under them, which still need their own
+  real evidence for their own leftover content, not a borrowed entry point
+  that actually belongs to one of their nested entries
+- For every directory with more than one or two exported candidates, its own
+  root-level file (one matching or resembling the directory's own name) was
+  explicitly checked as a possible entry point before any of its nested
+  children were accepted as one instead (see the skill's Section 3) —
+  `is_exported: true` being true for several candidates in the same
+  directory does not by itself tell you which of them is the real entry
+  point, and a real run picked deeply-nested internal components while
+  missing the directory's actual top-level one this way
+- No unit exceeds roughly 5-6 entry points without having been split
+- Entry points that looked like a complexity/size outlier or had a generic
+  dispatcher name were checked for internal dispatch via the skill's method
+  and expanded into `dispatched_handler` sub-entries where confirmed, before
+  the unit-splitting count above was finalized
+- Every unit was swept for registration/configuration-based functionality
+  with no callable entry point of its own, where the repository's stack made
+  that a plausible gap
+- Every entry point has all five fields filled: qualified_name, kind,
+  file_path, signature, purpose, with `kind` assigned via the skill's mapping
+  table
+- No entry point description exceeds one sentence — anything longer means
+  you are doing Stage B's job
+- `project_name` matches the exact indexed project name supplied in the
+  request
 - `build_batch_queue` was called after writing and verifying the index
 
 End with a concise completion message containing:

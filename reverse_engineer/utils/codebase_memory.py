@@ -117,35 +117,6 @@ class CodebaseMemoryCLI:
         )
 
 
-    def check_index_coverage(
-        self,
-        project: str,
-        paths: list[str] | None = None,
-        scopes: list[str] | None = None,
-        scope_limit: int = 200,
-        scope_offset: int = 0,
-    ):
-        """
-        Check indexing coverage for files or directory scopes.
-
-        Exactly one of `paths` or `scopes` should be provided.
-        """
-
-        if paths is None and scopes is None:
-            raise ValueError("Either 'paths' or 'scopes' must be provided.")
-
-        if paths is not None and scopes is not None:
-            raise ValueError("Only one of 'paths' or 'scopes' may be provided.")
-
-        return self._run(
-            "check_index_coverage",
-            project=project,
-            paths=paths,
-            scopes=scopes,
-            scope_limit=scope_limit,
-            scope_offset=scope_offset,
-        )
-    
     def list_projects(self):
         return self._run("list_projects")
 

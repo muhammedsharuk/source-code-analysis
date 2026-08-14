@@ -5,24 +5,39 @@ from .subagents.architecture_agent import create_architecture_agent
 from .subagents.code_index_agent import create_code_index_agent
 from .subagents.epics_agent import create_epics_agent
 from .subagents.feature_agent import create_feature_agent
+from .subagents.index_batch_agent import create_index_batch_agent
 from .subagents.task_agent import create_task_agent
 from .subagents.user_stories_agent import create_user_stories_agent
 from prompts.orchestrator import get_orchestrator_prompt
 from tools.codebase_memory_tools import CODEBASE_MEMORY_TOOLS
 from tools.batch_queue_tools import ORCHESTRATOR_BATCH_QUEUE_TOOLS
+from tools.checklist_tools import seed_checklist
+from tools.index_batch_queue_tools import ORCHESTRATOR_INDEX_BATCH_QUEUE_TOOLS
 from utils.naming import safe_directory_name
 from config import standard_llm_model
 
+# create_code_index_agent (the old, single-shot Stage A agent) is kept
+# registered but is no longer what the orchestrator prompt drives — Stage 2
+# now uses the deterministic seed/batch-queue flow and create_index_batch_agent
+# instead. It stays available here until a real run of the new path has been
+# cross-checked against the real graph, so there is something to fall back
+# to or compare against if the new path needs adjustment.
 subagents = [
     create_architecture_agent(),
     create_code_index_agent(),
     create_epics_agent(),
     create_feature_agent(),
+    create_index_batch_agent(),
     create_task_agent(),
     create_user_stories_agent(),
 ]
 
-ORCHESTRATOR_TOOLS = CODEBASE_MEMORY_TOOLS + ORCHESTRATOR_BATCH_QUEUE_TOOLS
+ORCHESTRATOR_TOOLS = (
+    CODEBASE_MEMORY_TOOLS
+    + ORCHESTRATOR_BATCH_QUEUE_TOOLS
+    + ORCHESTRATOR_INDEX_BATCH_QUEUE_TOOLS
+    + [seed_checklist]
+)
 
 current_dir = Path(__file__).resolve()
 parent_dir = current_dir.parent.parent
