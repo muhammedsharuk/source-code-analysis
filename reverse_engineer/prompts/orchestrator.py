@@ -40,18 +40,25 @@ Repository indexing is **always the first action**. No subagent may be invoked b
 
 ### Indexing Failure
 
-If `index_repository` fails, reports an indexing error, or does not successfully index the repository, then **stop immediately**. Report the indexing failure and do not invoke any subagent.
+If `index_repository` fails, or its response contains an `error` field, or it does not clearly identify an indexed project, then **stop immediately**. Report the indexing failure and do not invoke any subagent. Do not assume a particular `status` string in the response means success — `index_repository`'s own `status` field is not a reliable success signal on its own (a first-time full index and an incremental re-index have been observed to report different values); the presence of an `error` field is what actually signals failure here, and mandatory confirmation happens in the next step below.
 
 ### Resolve the Exact Project Name
 
-After successful indexing:
+After `index_repository` returns without an `error` field:
 
 * Determine the exact indexed project name from the `index_repository` response.
 * If the response does not clearly provide the project name, call `list_projects` and match the project whose root path corresponds to the repository path provided by the user.
 
 Never guess, reconstruct, derive from the filesystem path, or reformat the project name. Use the **exact indexed project name verbatim** for every subsequent operation — every tool call, every subagent delegation, every `save_markdown_document` call.
 
-Optionally use `index_status` with the resolved project name to verify that indexing completed successfully. Do not call `index_repository` again for this request once indexing has succeeded.
+### Confirm Indexing Actually Completed (mandatory — do not skip)
+
+`index_repository` returning without a tool error is not proof the graph is actually ready to query. Before doing anything else — before `seed_checklist`, before any subagent — call `index_status` with the resolved project name and inspect its response:
+
+* Treat indexing as genuinely complete only if the response has **no `error` field**, its `status` field is exactly `"ready"`, **and** its `nodes` count is greater than 0. All three must hold; a `"ready"` status with zero nodes is not usable and `seed_checklist` will build a checklist against an empty graph.
+* If the response instead has an `error` field (for example "project not found or not indexed"), the resolved project name is almost certainly wrong. That error response already lists `available_projects` — re-resolve the correct project name from that list (matching the repository's root path) instead of calling `list_projects` again, then re-check `index_status` with the corrected name.
+* If `index_status` reports some other `status` value (neither `"ready"` nor an `error`), do not guess what it means or wait/retry hoping it changes — indexing is synchronous (`index_repository` does not return until indexing has finished), so a non-`"ready"` status will not resolve itself with time. Stop, and report the exact `status` value observed as the indexing failure.
+* Do not call `index_repository` again for this request once this check has confirmed `"ready"` with a non-zero node count.
 
 ---
 
@@ -317,6 +324,7 @@ Do not pass complete generated documents, index contents, or batch payloads in s
 You must:
 
 * Index the repository before invoking any agent, and resolve the exact indexed project name.
+* Confirm indexing actually completed via `index_status` (`status == "ready"` and `nodes > 0`, no `error` field) before calling `seed_checklist` or any subagent — never treat a merely error-free `index_repository` response as sufficient on its own.
 * Use the exact project name verbatim everywhere.
 * Call `seed_checklist` and `build_index_batch_queue` yourself (Stage 2.1-2.2) — these are deterministic tools, not delegations.
 * Drive both the index batch loop (Stage 2.3) and the Task Agent batch loop (Stage 3) mechanically: fetch → delegate → mark → repeat, one batch at a time, never concurrently.
@@ -345,7 +353,7 @@ The batched Index Batch Agent and the batched Task Agent should use Codebase Mem
 
 The only valid execution order is:
 
-**Repository → Index → Resolve Project Name → Seed Checklist → Build Index Batch Queue → Index Batch Loop (Index Batch Agent, one batch at a time) → Merge Index Batches → Resolve Coverage Problems (bounded) → Build Batch Queue → Validate index/queue → Batch Loop (Task Agent, one batch at a time) → Merge Task Batches (merge_task_batches) → User Story Agent → Feature Agent → Epic Agent → Architecture Agent → Final Consistency Check**
+**Repository → Index → Resolve Project Name → Confirm Indexing Complete (`index_status`) → Seed Checklist → Build Index Batch Queue → Index Batch Loop (Index Batch Agent, one batch at a time) → Merge Index Batches → Resolve Coverage Problems (bounded) → Build Batch Queue → Validate index/queue → Batch Loop (Task Agent, one batch at a time) → Merge Task Batches (merge_task_batches) → User Story Agent → Feature Agent → Epic Agent → Architecture Agent → Final Consistency Check**
 
 ---
 
@@ -353,7 +361,7 @@ The only valid execution order is:
 
 Return a summary indicating:
 
-* The exact indexed project name.
+* The exact indexed project name, and the `index_status` result that confirmed indexing was complete before Stage 2 began.
 * Total index batches and task batches processed, and how many succeeded vs. permanently failed (if any).
 * Whether checklist coverage reached `all_clear: true`, or which paths remained unresolved after the bounded retry budget in Stage 2.5.
 * Confirmation that TASKS.md, USER_STORIES.md, FEATURES.md, EPICS.md, and ARCHITECTURE.md all exist and are non-empty.

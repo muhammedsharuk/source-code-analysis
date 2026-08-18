@@ -14,7 +14,7 @@ from tools.batch_queue_tools import ORCHESTRATOR_BATCH_QUEUE_TOOLS
 from tools.checklist_tools import seed_checklist
 from tools.index_batch_queue_tools import ORCHESTRATOR_INDEX_BATCH_QUEUE_TOOLS
 from utils.naming import safe_directory_name
-from config import standard_llm_model
+from config import large_llm_model
 
 # create_code_index_agent (the old, single-shot Stage A agent) is kept
 # registered but is no longer what the orchestrator prompt drives — Stage 2
@@ -53,7 +53,7 @@ def create_orchestrator_agent(repo_path: str):
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     agent = create_deep_agent(
-        model=standard_llm_model,
+        model=large_llm_model,
         system_prompt=get_orchestrator_prompt(),
         subagents=subagents,
         tools=ORCHESTRATOR_TOOLS,

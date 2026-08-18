@@ -130,6 +130,19 @@ _MIN_LEAF_SIZE_SEARCH_ITERATIONS = 12
 # 50,000.
 DEFAULT_MIN_LEAF_SIZE = 15
 
+# Once a directory has at least one child clearing `min_leaf_size` (making
+# that level "split-worthy"), any *other* child at that same level whose own
+# subtree reaches this much smaller, fixed floor still gets its own entry
+# too, rather than being folded into the parent's leftover bucket alongside
+# genuinely tiny/loose content. This is deliberately NOT scaled with
+# `min_leaf_size` the way `DEFAULT_MIN_LEAF_SIZE` is: `min_leaf_size` is
+# searched per-repo to hit a total *entry-count* target (see
+# `_find_min_leaf_size`), so on a monorepo with several large sibling
+# services it lands well above the real size of smaller-but-still-distinct
+# sibling services — those would otherwise vanish into the ancestor's
+# leftover entry, indistinguishable from stray top-level files.
+_MIN_SIBLING_ENTRY_SIZE = 5
+
 # Common test-directory conventions across languages/frameworks, excluded
 # from coverage the same way the skill excludes test packages from units.
 _TEST_PATH_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "__mocks__"}
@@ -261,13 +274,39 @@ def _subtree_total(node: dict[str, Any]) -> int:
 def _seed_recursive(node: dict[str, Any], prefix: str, min_leaf_size: int, out: list[tuple[str, int]]) -> None:
     children = node["children"]
     qualifying = {name: c for name, c in children.items() if _subtree_total(c) >= min_leaf_size}
-    non_qualifying_total = sum(_subtree_total(c) for name, c in children.items() if name not in qualifying)
-    own_total = node["files"] + non_qualifying_total
 
     if len(qualifying) >= 1:
+        # This level is "split-worthy": at least one child is large enough to
+        # earn its own entry on `min_leaf_size` alone. A real run showed that
+        # folding every *other* child into this node's own leftover bucket in
+        # that case is wrong when one of those other children is itself a
+        # distinct, non-trivial subtree (e.g. a monorepo with ten ~100-file
+        # services plus two ~20-file services and a 1-file config folder,
+        # all direct siblings) — `min_leaf_size` is searched to hit a
+        # repo-wide *entry-count* target, so it lands well above what the
+        # smaller-but-still-real services need, and they silently vanish into
+        # a generic ancestor entry indistinguishable from stray top-level
+        # files. Promoting any such sibling with real, non-trivial content of
+        # its own gives it a real entry instead — but only above
+        # `_MIN_SIBLING_ENTRY_SIZE`, so a genuinely tiny/loose sibling (a
+        # single Dockerfile, an empty stub folder) still folds into the
+        # parent rather than bloating the checklist with noise entries.
+        promoted = {
+            name: c
+            for name, c in children.items()
+            if name not in qualifying and _subtree_total(c) >= _MIN_SIBLING_ENTRY_SIZE
+        }
+        folded_total = sum(
+            _subtree_total(c)
+            for name, c in children.items()
+            if name not in qualifying and name not in promoted
+        )
+        own_total = node["files"] + folded_total
         if own_total > 0:
             out.append((prefix or ".", own_total))
         for name, child in qualifying.items():
+            _seed_recursive(child, f"{prefix}/{name}" if prefix else name, min_leaf_size, out)
+        for name, child in promoted.items():
             _seed_recursive(child, f"{prefix}/{name}" if prefix else name, min_leaf_size, out)
         return
 
@@ -342,19 +381,26 @@ def seed_checklist(
 
     Fetches every indexed file's path (paginated `search_graph(label="File")`
     calls, excluding common test-directory/test-file conventions), then
-    recursively splits the resulting tree wherever more than one sibling
-    subtree is individually large enough to matter, collapsing single-child
-    chains and small subtrees into their nearest qualifying ancestor. The
-    size threshold that decides "large enough to matter" is not a fixed
-    number: by default it is searched for so the resulting entry count lands
-    in a band that scales with the repo's real file count, so this behaves
-    sensibly on a 50-file repo and a 50,000-file monorepo alike rather than
-    being calibrated to whichever project it was last tuned against. The
-    result is written to `/workspace/code_index_checklist.json` with every
-    entry `"pending"` and a real `size_hint` already filled in — call this
-    once, first, before any other checklist work, so the entry set itself is
-    not something the agent can narrow to dodge the completion checks in
-    `verify_checklist_coverage`.
+    recursively splits the resulting tree wherever at least one sibling
+    subtree is individually large enough to matter. Once a level splits this
+    way, any *other* sibling at that same level still keeps its own entry as
+    long as it clears a much smaller, fixed floor (`_MIN_SIBLING_ENTRY_SIZE`)
+    — only siblings below that floor (stray top-level files, a single config
+    folder) fold into the nearest qualifying ancestor. This matters because
+    the main size threshold is searched for a repo-wide entry-count target,
+    not per-branch: on a monorepo with several large services plus a couple
+    of smaller-but-still-real ones, that threshold lands well above what the
+    smaller services need, and without this sibling floor they would vanish
+    into the ancestor's leftover entry indistinguishable from stray files.
+    The main size threshold is not a fixed number either: by default it is
+    searched for so the resulting entry count lands in a band that scales
+    with the repo's real file count, so this behaves sensibly on a 50-file
+    repo and a 50,000-file monorepo alike rather than being calibrated to
+    whichever project it was last tuned against. The result is written to
+    `/workspace/code_index_checklist.json` with every entry `"pending"` and
+    a real `size_hint` already filled in — call this once, first, before any
+    other checklist work, so the entry set itself is not something the agent
+    can narrow to dodge the completion checks in `verify_checklist_coverage`.
 
     Args:
         project_name: The exact indexed project name.
