@@ -48,6 +48,13 @@ def create_orchestrator_agent(repo_path: str):
     (under `temp/<safe-repo-name>/`) so that running the pipeline against a
     different repository never overwrites another repository's intermediate
     TASKS.md / USER_STORIES.md / FEATURES.md / EPICS.md / ARCHITECTURE.md files.
+
+    Deliberately no `checkpointer`: a run's in-flight state isn't meant to
+    survive a process restart (see `server/run_store.py`'s docstring — a
+    prior version resumed runs this way and it produced duplicate concurrent
+    runs in practice). Restarting the server abandons any run in progress;
+    only its already-completed output is ever browsable afterwards (see
+    `server/history_store.py`).
     """
     workspace_dir = parent_dir / "temp" / safe_directory_name(repo_path, default="unnamed-repo")
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -57,11 +64,26 @@ def create_orchestrator_agent(repo_path: str):
         system_prompt=get_orchestrator_prompt(),
         subagents=subagents,
         tools=ORCHESTRATOR_TOOLS,
+        # virtual_mode=True is required here, not optional: CompositeBackend
+        # strips the "/workspace/" or "/skills/" prefix before delegating to
+        # the routed FilesystemBackend, but leaves the leading "/" on the
+        # remainder (e.g. "/workspace/index_partial/x.json" ->
+        # "/index_partial/x.json"). With virtual_mode's old default (False),
+        # FilesystemBackend treats that leading slash as a real OS-absolute
+        # path and resolves it from the drive root, bypassing root_dir
+        # entirely — confirmed directly: every Index Batch Agent write to
+        # its own partial file was silently landing at
+        # C:\index_partial\{batch_id}.json instead of
+        # temp\<repo>\index_partial\{batch_id}.json, which is exactly why
+        # mark_index_batch_complete kept reporting the file as missing (it
+        # checks the real intended path, not wherever the write actually
+        # went). virtual_mode=True makes every path resolve relative to
+        # root_dir instead, which is what CompositeBackend routing requires.
         backend=CompositeBackend(
         default=StateBackend(),
         routes={
-            "/skills/": FilesystemBackend(root_dir=parent_dir/ "skills"),
-            "/workspace/": FilesystemBackend(root_dir=workspace_dir),
+            "/skills/": FilesystemBackend(root_dir=parent_dir/ "skills", virtual_mode=True),
+            "/workspace/": FilesystemBackend(root_dir=workspace_dir, virtual_mode=True),
         },
     )
     )

@@ -147,7 +147,15 @@ Because this file belongs only to your batch, this is a **plain write, not
 an append**: no other batch will ever write to this same path, so overwriting
 your own file from scratch — even on a retry — is always correct and safe.
 
-Write exactly this structure:
+**You must actually call the filesystem write tool with this path and
+content — do not just print this JSON in your reply.** The block below is
+the file's content, not reply formatting; it looks like the trailing status
+block later in this prompt, but that one goes in your reply text and this
+one does not. `mark_index_batch_complete` reads this exact file from disk
+independently of anything you say — a batch that never calls the write tool
+here will be rejected and retried no matter what your reply claims.
+
+Write exactly this structure as this file's content:
 
 ```json
 {
@@ -193,8 +201,11 @@ Rules for this structure:
 - Never give a path both empty `units` and a null `reason` — that leaves it
   unresolved and this batch will be rejected and retried.
 
-After writing, read `/workspace/index_partial/{batch_id}.json` back and
-confirm it contains one resolved entry for every assigned path.
+After calling the write tool, read `/workspace/index_partial/{batch_id}.json`
+back with the filesystem read tool and confirm it contains one resolved
+entry for every assigned path — if the read fails or comes back empty, the
+write did not actually happen; call the write tool again before reporting
+any outcome below.
 
 ## Reporting the outcome
 
