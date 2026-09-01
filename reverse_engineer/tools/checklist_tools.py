@@ -145,7 +145,12 @@ _MIN_SIBLING_ENTRY_SIZE = 5
 
 # Common test-directory conventions across languages/frameworks, excluded
 # from coverage the same way the skill excludes test packages from units.
-_TEST_PATH_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "__mocks__"}
+# `androidtest`/`sharedtest` are Android's Gradle-mandated instrumented/shared
+# test source sets (`src/androidTest`, `src/sharedTest`), distinct from the
+# generic `test` set — a real run leaked an `androidTest` file into a parent
+# entry's own scope because only `test`/`tests` were recognized, and a batch
+# agent then covered that entry with an unrelated sibling file instead.
+_TEST_PATH_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "__mocks__", "androidtest", "sharedtest"}
 
 # Common test-*file* conventions for stacks that colocate tests with source
 # rather than using a separate test directory (e.g. Go's `_test.go`, several

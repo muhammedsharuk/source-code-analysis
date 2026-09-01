@@ -79,6 +79,24 @@ For each assigned path:
    `search_own_scope_entry_points` calls — this path resolves to a `reason`
    instead of units (see the output shape below). Never write a `reason`
    without having actually made those calls.
+
+   A path that returns results, even hundreds of them, is NOT the same as a
+   path that returns nothing — do not write a `reason` for it just because
+   every result looks trivial (e.g. zero `complexity`/`lines`, or a `Class`
+   result that is really a markup element from a non-code file like an XML
+   layout, drawable, animation, or font declaration, one pseudo-node per
+   tag). Coverage verification independently re-queries the graph and will
+   reject a `reason` the moment it finds any real result in the path's own
+   scope, no matter how trivial that result looks to you — it cannot tell
+   "trivial but real" apart from "nothing here," so it always sides with the
+   graph. For a path like this, resolve it with `covered_by` instead: pick
+   one (or a few, if there are structurally distinct kinds of declarations)
+   representative result(s), record each as an entry point with
+   `kind: "other"` and a `purpose` describing what the declaration actually
+   configures (e.g. "Declares the app's XML layout resources for its
+   screens"), and do not try to list all of them individually — this is the
+   same pattern already used elsewhere in this pipeline for things like
+   navigation-graph or manifest-registration XML.
 5. If the results are large enough or structurally distinct enough that one
    path should become multiple coverage units instead of one, split it —
    same threshold as elsewhere in this pipeline: **more than roughly 5-6

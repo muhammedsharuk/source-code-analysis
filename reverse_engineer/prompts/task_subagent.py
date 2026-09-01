@@ -108,6 +108,17 @@ tracing each entry point end-to-end with `trace_path`, reading source with
 `get_code_snippet`/`search_code` as your primary method rather than a
 fallback, and the evidence discipline that governs every claim you write.
 
+`get_code_snippet`/`search_code` are the ONLY tools that can read this
+repository's real source. Any generic filesystem tool you may also have
+(a plain read/write/ls/edit tool) only reaches this pipeline's own
+`/workspace/` output directory — it has no access to the repository being
+analyzed and will always fail if you give it a source file's path. If
+`get_code_snippet` returns nothing for an entry point (this happens for
+declarative/config entries, e.g. an XML resource element, that aren't a
+real code symbol), do not look for another way to open that file — use the
+entry point's existing signature/purpose plus whatever `search_code` finds,
+and write "Insufficient evidence" for anything beyond that.
+
 For every entry point in your batch:
 1. Trace its full implementation path via `trace_path`, and read the
    relevant source via `get_code_snippet`/`search_code`.
