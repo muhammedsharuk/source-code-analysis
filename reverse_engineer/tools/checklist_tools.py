@@ -92,6 +92,7 @@ def _recheck_reason(
                 file_pattern=_scope_file_pattern(path),
                 limit=_RECHECK_PAGE_SIZE,
                 offset=offset,
+                format="json",
             )
             try:
                 data = _unwrap_cli_result(raw)
@@ -252,7 +253,9 @@ def _fetch_all_file_paths(cli: CodebaseMemoryCLI, project_name: str) -> tuple[li
     paths: list[str] = []
     offset = 0
     for _ in range(_MAX_FILE_FETCH_PAGES):
-        raw = cli.search_graph(project=project_name, label="File", limit=_FILE_FETCH_PAGE_SIZE, offset=offset)
+        raw = cli.search_graph(
+            project=project_name, label="File", limit=_FILE_FETCH_PAGE_SIZE, offset=offset, format="json"
+        )
         data = _unwrap_cli_result(raw)
         paths.extend(r.get("file_path", "") for r in data.get("results", []))
         if not data.get("has_more"):

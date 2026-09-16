@@ -329,7 +329,8 @@ def search_own_scope_entry_points(project_name: str, path: str, label: str) -> d
     truncated = True
     for _ in range(_SCOPE_MAX_PAGES):
         raw = cli.search_graph(
-            project=project_name, label=label, file_pattern=_scope_file_pattern(path), limit=_SCOPE_PAGE_SIZE, offset=offset
+            project=project_name, label=label, file_pattern=_scope_file_pattern(path), limit=_SCOPE_PAGE_SIZE, offset=offset,
+            format="json",
         )
         data = _unwrap_cli_result(raw)
         for result in data.get("results", []):

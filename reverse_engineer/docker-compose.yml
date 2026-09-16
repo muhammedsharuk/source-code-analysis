@@ -1,0 +1,19 @@
+services:
+  reverse-engineer:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Knowledge-graph indexes -- persists across container
+      # restarts/redeploys instead of re-indexing every repo from scratch.
+      - cbm-cache:/root/.cache/codebase-memory-mcp
+      # Final Markdown docs, browsable from the host.
+      - ./output:/app/output
+      # Wherever the repos REPO_PATH/start_analysis will point at actually
+      # live -- adjust the host side to your own repo storage location.
+      - ./repos:/repos:ro
+
+volumes:
+  cbm-cache:

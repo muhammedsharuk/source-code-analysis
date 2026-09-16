@@ -9,7 +9,7 @@ if __name__ == "__main__":
 
     request = (
         f"Index the repository at path '{repo_path}', "
-        "then discover the codebase and the features of the project."
+        "and generate task, user stories, feature, Epic and architecture documents"
     )
 
     orchestrator.invoke({"messages": [{"role": "user", "content": request}]})

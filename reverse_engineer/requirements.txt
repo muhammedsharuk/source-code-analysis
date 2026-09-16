@@ -4,3 +4,4 @@ langsmith
 langchain-openai
 fastapi
 uvicorn
+python-multipart

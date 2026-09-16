@@ -1,0 +1,11 @@
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.env
+temp/
+tools_output/
+output/
+server/runs/
+entry_point_lab/output/
+.git

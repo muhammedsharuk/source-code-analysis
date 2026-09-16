@@ -28,10 +28,13 @@ last-known status stuck at `"running"` forever.
 """
 
 import asyncio
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from fastapi import UploadFile
 
 from agents.orchestrator import create_orchestrator_agent
 
@@ -39,6 +42,14 @@ from .event_handler import EventHandler
 from .events import default_steps
 from .history_store import HistoryStore
 from .run_store import RunStore
+from utils.codebase_memory import CodebaseMemoryCLI
+from utils.naming import safe_directory_name
+from utils.zip_extract import UnsafeZipError, safe_extract_zip
+
+_REVERSE_ENGINEER_ROOT = Path(__file__).resolve().parent.parent
+UPLOADS_ROOT = _REVERSE_ENGINEER_ROOT / "uploads"
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # keep in step with zip_extract.MAX_UNCOMPRESSED_BYTES
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def _derive_name(repo_path: str) -> str:
@@ -69,6 +80,48 @@ class RunManager:
         name = _derive_name(repo_path)
         record = await self._store.create(run_id, repo_path, name)
         self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path))
+        return record
+
+    async def start_run_from_zip(self, file: UploadFile) -> dict[str, Any]:
+        """Save + safely extract an uploaded repo zip, then run the pipeline against it.
+
+        Unlike `start_run` (a path already living on this server, e.g. an
+        admin-mounted volume — left untouched after the run so it can be
+        reused), everything this method creates is this run's own private
+        copy. It is deleted in `_execute_run`'s cleanup regardless of how the
+        run ends, per the "treat every upload as one-off" retention decision
+        — see `docker-compose.yml`'s absence of an uploads volume, which is
+        deliberate: nothing here is meant to survive past its own run.
+        """
+        run_id = uuid.uuid4().hex
+        run_dir = UPLOADS_ROOT / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = run_dir / "upload.zip"
+
+        try:
+            size = 0
+            with zip_path.open("wb") as out:
+                while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise ValueError(f"Upload exceeds the {MAX_UPLOAD_BYTES} byte limit.")
+                    out.write(chunk)
+
+            extracted_dir = run_dir / "source"
+            safe_extract_zip(zip_path, extracted_dir)
+        except (ValueError, UnsafeZipError):
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+        finally:
+            # The compressed copy is never needed again once extraction has
+            # either succeeded or failed -- only the extracted tree (or
+            # nothing, on failure) needs to survive this method.
+            zip_path.unlink(missing_ok=True)
+
+        repo_path = str(extracted_dir)
+        name = _derive_name(file.filename or "uploaded-repo")
+        record = await self._store.create(run_id, repo_path, name)
+        self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path, ephemeral=True))
         return record
 
     def stop_run(self, run_id: str) -> bool:
@@ -217,7 +270,18 @@ class RunManager:
 
     # --- execution ----------------------------------------------------------
 
-    async def _execute_run(self, run_id: str, repo_path: str) -> None:
+    async def _execute_run(self, run_id: str, repo_path: str, ephemeral: bool = False) -> None:
+        """Run one pipeline end-to-end.
+
+        `ephemeral=True` (uploads only, see `start_run_from_zip`) means this
+        run's extracted source, workspace temp dir, and knowledge-graph index
+        are this run's own private, disposable copies -- all three are torn
+        down in `finally` regardless of how the run ends. `ephemeral=False`
+        (the existing path-based flow) leaves all three exactly as before:
+        the caller supplied that path and may still need it, or may want to
+        re-analyze it later with the graph index intact for a fast
+        incremental re-index.
+        """
         handler = EventHandler(run_id, self)
 
         try:
@@ -256,6 +320,33 @@ class RunManager:
             await handler.emit_terminal("failed", f"Pipeline run failed: {exc}")
         finally:
             self._tasks.pop(run_id, None)
+            if ephemeral:
+                await self._cleanup_ephemeral_run(run_id, repo_path)
+
+    async def _cleanup_ephemeral_run(self, run_id: str, repo_path: str) -> None:
+        """Delete an uploaded run's private copies: extracted source, workspace
+        temp dir, and knowledge-graph index -- run regardless of whether the
+        pipeline completed, failed, or was stopped, so nothing from a one-off
+        upload lingers. `output/<project>/*.md` is deliberately untouched:
+        that is the actual deliverable.
+        """
+        record = await self._store.get(run_id)
+        project_name = (record or {}).get("project_name")
+
+        def _cleanup() -> None:
+            shutil.rmtree(UPLOADS_ROOT / run_id, ignore_errors=True)
+            workspace_dir = _REVERSE_ENGINEER_ROOT / "temp" / safe_directory_name(repo_path, default="unnamed-repo")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+            if project_name:
+                try:
+                    CodebaseMemoryCLI().delete_project(project=project_name)
+                except Exception:
+                    # Best-effort: a stray/partial knowledge-graph index left
+                    # behind is a disk-space nuisance, never a reason to mask
+                    # this run's own real outcome (already recorded above).
+                    pass
+
+        await asyncio.to_thread(_cleanup)
 
     async def _record_completed(self, run_id: str, repo_path: str) -> None:
         """Write this run's one-time, permanent history record.

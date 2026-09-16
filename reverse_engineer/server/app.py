@@ -15,10 +15,12 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from utils.zip_extract import UnsafeZipError
 
 from .events import AnalysisStep, FileNode, ProjectSummary
 from .run_manager import run_manager
@@ -64,6 +66,26 @@ async def start_analysis(body: StartAnalysisRequest) -> ProjectSummary:
     if not body.repoPath.strip():
         raise HTTPException(status_code=400, detail="repoPath is required.")
     record = await run_manager.start_run(body.repoPath.strip())
+    return ProjectSummary(id=record["run_id"], name=record["name"], repoUrl=record["repo_path"], status="active")
+
+
+@app.post("/projects/upload", response_model=ProjectSummary)
+async def start_analysis_from_zip(file: UploadFile = File(...)) -> ProjectSummary:
+    """Same as `POST /projects`, but for a client with no server-visible path.
+
+    A browser (or any remote caller) can't hand the server a filesystem path
+    from its own machine -- there's no path a container/server could resolve
+    for it. This accepts the repo as a zip instead, extracts it into a
+    private, run-scoped copy, and runs the identical pipeline against that.
+    That copy (and its knowledge-graph index) is deleted once the run ends;
+    see `RunManager.start_run_from_zip`.
+    """
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip uploads are supported.")
+    try:
+        record = await run_manager.start_run_from_zip(file)
+    except (ValueError, UnsafeZipError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ProjectSummary(id=record["run_id"], name=record["name"], repoUrl=record["repo_path"], status="active")
 
 

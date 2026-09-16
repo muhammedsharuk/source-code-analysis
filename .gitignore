@@ -21,3 +21,9 @@ __pycache__/
 *.so
 
 temp/
+tools_output/
+output/
+uploads/
+reverse_engineer/server/runs/
+reverse_engineer/entry_point_lab/output/
+entry_point_lab/
