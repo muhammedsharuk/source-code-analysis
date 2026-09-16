@@ -1,28 +1,28 @@
-"""FastAPI server the frontend talks to instead of `mockApi.ts`'s simulated bodies.
+"""Minimal HTTP API for the reverse-engineering pipeline: trigger a run, fetch its files.
+
+Job records, status, and history are owned by whatever calls this service
+(e.g. asdlc-assistant's backend, via its own Postgres) -- this service does
+not track or expose a job list or status endpoint. Live progress is
+published to NATS as it happens (see nats_publisher.py), not polled from
+here. See ASDLC_INTEGRATION_PLAN.md.
 
 Run with: `uvicorn server.app:app --reload` (from the `reverse_engineer/`
 directory, so the existing `agents`/`tools`/`config` absolute imports keep
 resolving the same way they do for `main.py`).
-
-Endpoint shapes mirror `frontend/src/lib/mockApi.ts` + `types.ts` field-for-
-field, so swapping the frontend over should only mean replacing each mock
-function's body with a real `fetch`/`EventSource` call — no component
-changes.
 """
 
-import asyncio
-import json
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import PlainTextResponse
 
 from utils.zip_extract import UnsafeZipError
 
-from .events import AnalysisStep, FileNode, ProjectSummary
+from .events import FileNode, JobSummary
 from .run_manager import run_manager
 
 
@@ -35,7 +35,7 @@ async def lifespan(_app: FastAPI):
         await run_manager.shutdown()
 
 
-app = FastAPI(title="Deep Index Server", lifespan=lifespan)
+app = FastAPI(title="Reverse Engineer Trigger API", lifespan=lifespan)
 
 # Local dev only: the Vite frontend runs on a different origin/port.
 app.add_middleware(
@@ -46,135 +46,47 @@ app.add_middleware(
 )
 
 
-class StartAnalysisRequest(BaseModel):
-    repoPath: str
+@app.post("/jobs", response_model=JobSummary)
+async def start_job(
+    name: str = Form(...),
+    job_id: str | None = Form(None),
+    file: UploadFile = File(...),
+) -> JobSummary:
+    """Trigger the pipeline: extracts the uploaded zip and runs it in the background.
 
-
-@app.get("/projects", response_model=list[ProjectSummary])
-async def list_projects() -> list[ProjectSummary]:
-    """Every analysis for the home dashboard: active, failed, and completed.
-
-    See `RunManager.list_projects` for how in-process runs (real-time
-    status) and `HistoryStore`'s completed-only record (survives a restart)
-    are merged into one list.
-    """
-    return [ProjectSummary(**p) for p in await run_manager.list_projects()]
-
-
-@app.post("/projects", response_model=ProjectSummary)
-async def start_analysis(body: StartAnalysisRequest) -> ProjectSummary:
-    if not body.repoPath.strip():
-        raise HTTPException(status_code=400, detail="repoPath is required.")
-    record = await run_manager.start_run(body.repoPath.strip())
-    return ProjectSummary(id=record["run_id"], name=record["name"], repoUrl=record["repo_path"], status="active")
-
-
-@app.post("/projects/upload", response_model=ProjectSummary)
-async def start_analysis_from_zip(file: UploadFile = File(...)) -> ProjectSummary:
-    """Same as `POST /projects`, but for a client with no server-visible path.
-
-    A browser (or any remote caller) can't hand the server a filesystem path
-    from its own machine -- there's no path a container/server could resolve
-    for it. This accepts the repo as a zip instead, extracts it into a
-    private, run-scoped copy, and runs the identical pipeline against that.
-    That copy (and its knowledge-graph index) is deleted once the run ends;
-    see `RunManager.start_run_from_zip`.
+    `job_id` is optional -- a caller that needs to control the id itself
+    (e.g. asdlc-assistant's backend, which already generated a Postgres row
+    for this job before calling here) passes one, so this service's
+    internal run id matches the caller's own record; omit it to have one
+    generated here for direct/manual use of this API.
     """
     if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip uploads are supported.")
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name is required.")
     try:
-        record = await run_manager.start_run_from_zip(file)
+        record = await run_manager.start_job(job_id, name.strip(), file)
     except (ValueError, UnsafeZipError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return ProjectSummary(id=record["run_id"], name=record["name"], repoUrl=record["repo_path"], status="active")
+    return JobSummary(**record)
 
 
-@app.post("/projects/{run_id}/stop")
-async def stop_analysis(run_id: str) -> dict:
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-    stopped = run_manager.stop_run(run_id)
-    if not stopped:
-        raise HTTPException(status_code=409, detail="This run is not currently active.")
-    return {"status": "stopping"}
-
-
-@app.get("/projects/{run_id}", response_model=ProjectSummary)
-async def get_project(run_id: str) -> ProjectSummary:
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-    return ProjectSummary(**project)
-
-
-@app.get("/projects/{run_id}/steps", response_model=list[AnalysisStep])
-async def get_steps(run_id: str) -> list[AnalysisStep]:
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-    return [AnalysisStep(**s) for s in run_manager.get_steps(run_id)]
-
-
-@app.get("/projects/{run_id}/logs/stream")
-async def stream_logs(run_id: str):
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-
-    async def event_source():
-        # Subscribe before replaying history, so nothing published between
-        # "read history" and "start listening live" is missed — a possible
-        # duplicate at the boundary is a much smaller problem for a log
-        # viewer than a gap would be.
-        queue = run_manager.subscribe(run_id)
-        try:
-            for envelope in run_manager.replay(run_id):
-                yield _format_sse(envelope)
-            while True:
-                envelope = await queue.get()
-                yield _format_sse(envelope)
-                if envelope.get("kind") == "terminal":
-                    break
-        except asyncio.CancelledError:
-            raise
-        finally:
-            run_manager.unsubscribe(run_id, queue)
-
-    return StreamingResponse(event_source(), media_type="text/event-stream")
-
-
-def _format_sse(envelope: dict) -> str:
-    kind = envelope.get("kind", "log")
-    payload = envelope.get("payload")
-    return f"event: {kind}\ndata: {json.dumps(payload)}\n\n"
-
-
-@app.get("/projects/{run_id}/files", response_model=list[FileNode])
-async def get_result_files(run_id: str) -> list[FileNode]:
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-    output_dir = await run_manager.output_dir_for(run_id)
+@app.get("/jobs/{job_id}/files", response_model=list[FileNode])
+async def get_job_files(job_id: str) -> list[FileNode]:
+    output_dir = await run_manager.output_dir_for(job_id)
     if output_dir is None or not output_dir.is_dir():
         return []
-    children = [
-        FileNode(name=p.name, path=p.name, type="file")
-        for p in sorted(output_dir.glob("*.md"))
-    ]
+    children = [FileNode(name=p.name, path=p.name, type="file") for p in sorted(output_dir.glob("*.md"))]
     if not children:
         return []
     return [FileNode(name="output", path="output", type="folder", children=children)]
 
 
-@app.get("/projects/{run_id}/files/content")
-async def get_file_content(run_id: str, path: str = Query(...)) -> str:
-    project = await run_manager.get_project(run_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Unknown project id.")
-    output_dir = await run_manager.output_dir_for(run_id)
+@app.get("/jobs/{job_id}/files/content")
+async def get_job_file_content(job_id: str, path: str = Query(...)) -> PlainTextResponse:
+    output_dir = await run_manager.output_dir_for(job_id)
     if output_dir is None:
-        raise HTTPException(status_code=404, detail="No output yet for this project.")
+        raise HTTPException(status_code=404, detail="No output yet for this job.")
 
     # path is a bare filename ("TASKS.md"), possibly prefixed with the
     # "output/" folder segment used in the tree above — strip that segment
@@ -183,4 +95,7 @@ async def get_file_content(run_id: str, path: str = Query(...)) -> str:
     file_path = output_dir / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"No such file: {filename}")
-    return file_path.read_text(encoding="utf-8")
+    # A bare `-> str` return here would have FastAPI JSON-encode the string
+    # (wrapping it in quotes, escaping newlines as literal `\n`) instead of
+    # sending it as real text -- explicit PlainTextResponse avoids that.
+    return PlainTextResponse(file_path.read_text(encoding="utf-8"))

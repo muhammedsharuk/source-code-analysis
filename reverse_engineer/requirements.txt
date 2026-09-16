@@ -5,3 +5,5 @@ langchain-openai
 fastapi
 uvicorn
 python-multipart
+nats-py
+psycopg[binary]

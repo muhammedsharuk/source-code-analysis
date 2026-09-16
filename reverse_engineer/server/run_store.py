@@ -1,4 +1,4 @@
-"""In-memory run registry, per-run event log, and per-run step snapshot.
+"""In-memory run registry and per-run progress snapshot.
 
 Deliberately NOT persisted to disk. An earlier version of this module wrote
 everything here (plus a LangGraph checkpointer in `run_manager.py`) to
@@ -32,8 +32,6 @@ class RunStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._registry: dict[str, dict[str, Any]] = {}
-        self._events: dict[str, list[dict[str, Any]]] = {}
-        self._steps: dict[str, list[dict[str, Any]]] = {}
         self._progress: dict[str, dict[str, Any]] = {}
 
     # --- registry -----------------------------------------------------
@@ -81,23 +79,6 @@ class RunStore:
         """
         async with self._lock:
             return [dict(r) for r in self._registry.values()]
-
-    # --- per-run event log ---------------------------------------------
-
-    def append_event(self, run_id: str, event: dict[str, Any]) -> None:
-        self._events.setdefault(run_id, []).append(event)
-
-    def read_events(self, run_id: str) -> list[dict[str, Any]]:
-        return list(self._events.get(run_id, []))
-
-    # --- per-run step snapshot ------------------------------------------
-
-    def save_steps(self, run_id: str, steps: list[dict[str, Any]]) -> None:
-        self._steps[run_id] = list(steps)
-
-    def load_steps(self, run_id: str) -> list[dict[str, Any]] | None:
-        steps = self._steps.get(run_id)
-        return list(steps) if steps is not None else None
 
     # --- per-run progress counters ---------------------------------------
 

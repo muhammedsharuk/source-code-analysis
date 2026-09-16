@@ -12,11 +12,12 @@ def create_chat_model(model_name: str):
     return init_chat_model(**kwargs)
     
 
-repo_path = os.getenv("REPO_PATH")
 compact_llm_model = create_chat_model(os.getenv("COMPACT_LLM_MODEL"))
 standard_llm_model = create_chat_model(os.getenv("STANDARD_LLM_MODEL"))
 large_llm_model = create_chat_model(os.getenv("LARGE_LLM_MODEL"))
 
-
-default_output_dir = Path(__file__).resolve().parent / "outputs"
-output_dir = Path(os.getenv("OUTPUT_DIR", str(default_output_dir))).expanduser().resolve()
+# Always the project-relative "output" folder -- not configurable. The
+# job-based API (server/app.py) is the only entry point now; every job's
+# docs land here, addressed by output_dir_for(job_id), never by a path a
+# caller chooses.
+output_dir = (Path(__file__).resolve().parent / "output").resolve()

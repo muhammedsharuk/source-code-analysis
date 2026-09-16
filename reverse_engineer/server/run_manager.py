@@ -1,11 +1,14 @@
-"""Owns the lifecycle of every pipeline run: starting, streaming, stopping.
+"""Owns the lifecycle of every pipeline job: starting, tracking, stopping.
 
-A run's actual agent execution is decoupled from any single HTTP/SSE
-connection — it runs in a background `asyncio.Task`, and any number of SSE
-subscribers can attach to (and detach from) the same run's live event feed
-without affecting it. This is what lets a page refresh reattach to an
-in-progress run instead of restarting or losing it, for as long as this
-process stays alive.
+A job's actual agent execution runs in a background `asyncio.Task`,
+independent of any HTTP request -- a caller starts a job, gets a `job_id`
+back immediately, and everything about the job's progress from then on is
+published live to NATS (see `nats_publisher.py`), not polled from this
+service. This service now only answers two questions over HTTP: "run this"
+(`POST /jobs`) and "give me the files it produced" (`GET
+/jobs/{job_id}/files*`) -- job records, status, and history live in
+whatever owns the caller side of this integration (see
+ASDLC_INTEGRATION_PLAN.md), not here.
 
 There is deliberately no persistence of a run's *in-flight* state (status,
 progress, steps) across a server restart (see `run_store.py`'s docstring for
@@ -38,8 +41,8 @@ from fastapi import UploadFile
 
 from agents.orchestrator import create_orchestrator_agent
 
+from . import job_db, nats_publisher
 from .event_handler import EventHandler
-from .events import default_steps
 from .history_store import HistoryStore
 from .run_store import RunStore
 from utils.codebase_memory import CodebaseMemoryCLI
@@ -61,7 +64,6 @@ class RunManager:
     def __init__(self) -> None:
         self._store = RunStore()
         self._history = HistoryStore()
-        self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
     # --- lifecycle --------------------------------------------------------
@@ -72,28 +74,25 @@ class RunManager:
     async def shutdown(self) -> None:
         for task in list(self._tasks.values()):
             task.cancel()
+        await nats_publisher.close()
 
-    # --- starting/observing/stopping runs -----------------------------------
+    # --- starting/observing/stopping jobs -----------------------------------
 
-    async def start_run(self, repo_path: str) -> dict[str, Any]:
-        run_id = uuid.uuid4().hex
-        name = _derive_name(repo_path)
-        record = await self._store.create(run_id, repo_path, name)
-        self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path))
-        return record
-
-    async def start_run_from_zip(self, file: UploadFile) -> dict[str, Any]:
+    async def start_job(self, job_id: str | None, name: str, file: UploadFile) -> dict[str, Any]:
         """Save + safely extract an uploaded repo zip, then run the pipeline against it.
 
-        Unlike `start_run` (a path already living on this server, e.g. an
-        admin-mounted volume — left untouched after the run so it can be
-        reused), everything this method creates is this run's own private
-        copy. It is deleted in `_execute_run`'s cleanup regardless of how the
-        run ends, per the "treat every upload as one-off" retention decision
-        — see `docker-compose.yml`'s absence of an uploads volume, which is
+        `job_id` is caller-supplied when the caller needs to control it (e.g.
+        asdlc-assistant's backend, which addresses this the same way it
+        addresses every other agent service's sessions) -- generated here
+        when omitted, e.g. for direct/manual use of this API.
+
+        Everything this method creates is this job's own private copy. It is
+        deleted in `_execute_run`'s cleanup regardless of how the run ends,
+        per the "treat every upload as one-off" retention decision — see
+        `docker-compose.yml`'s absence of an uploads volume, which is
         deliberate: nothing here is meant to survive past its own run.
         """
-        run_id = uuid.uuid4().hex
+        run_id = job_id or uuid.uuid4().hex
         run_dir = UPLOADS_ROOT / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         zip_path = run_dir / "upload.zip"
@@ -119,10 +118,9 @@ class RunManager:
             zip_path.unlink(missing_ok=True)
 
         repo_path = str(extracted_dir)
-        name = _derive_name(file.filename or "uploaded-repo")
         record = await self._store.create(run_id, repo_path, name)
         self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path, ephemeral=True))
-        return record
+        return {"job_id": run_id, "name": name, "status": "active"}
 
     def stop_run(self, run_id: str) -> bool:
         """Cancel a run's background task. Returns False if it wasn't running."""
@@ -131,67 +129,6 @@ class RunManager:
             return False
         task.cancel()
         return True
-
-    async def get_project(self, run_id: str) -> dict[str, Any] | None:
-        record = await self._store.get(run_id)
-        if record is not None:
-            status = {"running": "active", "completed": "complete", "failed": "failed", "stopped": "failed"}.get(
-                record["status"], "active"
-            )
-            return {"id": run_id, "name": record["name"], "repoUrl": record["repo_path"], "status": status}
-
-        # Not an active/known-this-process run — it may be a completed run
-        # from before a restart, which only `HistoryStore` still remembers.
-        completed = await self._history.get(run_id)
-        if completed is None:
-            return None
-        return {
-            "id": run_id,
-            "name": completed.get("name") or "repository",
-            "repoUrl": completed.get("repo_path") or "",
-            "status": "complete",
-        }
-
-    async def list_projects(self) -> list[dict[str, Any]]:
-        """Every analysis the home dashboard should show: this process's own
-        runs (active, failed, or completed — real-time status) plus any
-        older completed run from before a restart that `HistoryStore` still
-        remembers and this process hasn't seen. A run present in both is
-        only listed once, using the live in-memory status.
-        """
-        in_memory = await self._store.list_all()
-        seen_ids = {r["run_id"] for r in in_memory}
-        projects = [
-            {
-                "id": r["run_id"],
-                "name": r["name"],
-                "repoUrl": r["repo_path"],
-                "status": {
-                    "running": "active",
-                    "completed": "complete",
-                    "failed": "failed",
-                    "stopped": "failed",
-                }.get(r["status"], "active"),
-            }
-            for r in in_memory
-        ]
-        # `list_all` already filters out records missing run_id/output_dir
-        # (see HistoryStore); name/repo_path still get a safe default here in
-        # case a future record shape ever omits them.
-        projects.extend(
-            {
-                "id": r["run_id"],
-                "name": r.get("name") or "repository",
-                "repoUrl": r.get("repo_path") or "",
-                "status": "complete",
-            }
-            for r in await self._history.list_all()
-            if r["run_id"] not in seen_ids
-        )
-        return projects
-
-    def get_steps(self, run_id: str) -> list[dict[str, Any]]:
-        return self._store.load_steps(run_id) or [s.model_dump() for s in default_steps()]
 
     async def output_dir_for(self, run_id: str) -> Path | None:
         """Resolve the project's persisted-output directory.
@@ -222,45 +159,20 @@ class RunManager:
             return None
         return Path(completed["output_dir"])
 
-    # --- subscription (SSE fan-out) ----------------------------------------
-
-    def subscribe(self, run_id: str) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
-        self._subscribers.setdefault(run_id, []).append(queue)
-        return queue
-
-    def unsubscribe(self, run_id: str, queue: asyncio.Queue) -> None:
-        subscribers = self._subscribers.get(run_id)
-        if subscribers and queue in subscribers:
-            subscribers.remove(queue)
-
-    def replay(self, run_id: str) -> list[dict[str, Any]]:
-        """Everything already sent for this run, for a client attaching mid-run."""
-        events = list(self._store.read_events(run_id))
-        steps = self._store.load_steps(run_id)
-        if steps is not None:
-            events.append({"kind": "steps", "payload": steps})
-        return events
-
     # --- publish surface used by EventHandler ------------------------------
+    #
+    # Live progress goes to NATS (a no-op if NATS_URL isn't configured, see
+    # nats_publisher.py), not to any in-process store -- nothing left in
+    # this service reads it back over HTTP.
 
     async def publish(self, run_id: str, logline: dict[str, Any]) -> None:
-        envelope = {"kind": "log", "payload": logline}
-        self._store.append_event(run_id, envelope)
-        for queue in self._subscribers.get(run_id, []):
-            queue.put_nowait(envelope)
+        await nats_publisher.publish_event(run_id, "log", logline)
 
     async def publish_steps(self, run_id: str, steps: list[dict[str, Any]]) -> None:
-        self._store.save_steps(run_id, steps)
-        envelope = {"kind": "steps", "payload": steps}
-        for queue in self._subscribers.get(run_id, []):
-            queue.put_nowait(envelope)
+        await nats_publisher.publish_event(run_id, "step_progress", {"steps": steps})
 
     async def publish_terminal(self, run_id: str, status: str, message: str) -> None:
-        envelope = {"kind": "terminal", "payload": {"status": status, "message": message}}
-        self._store.append_event(run_id, envelope)
-        for queue in self._subscribers.get(run_id, []):
-            queue.put_nowait(envelope)
+        await nats_publisher.publish_event(run_id, "end", {"status": status, "message": message})
 
     async def set_project_name(self, run_id: str, project_name: str) -> None:
         await self._store.update(run_id, project_name=project_name)
@@ -273,7 +185,7 @@ class RunManager:
     async def _execute_run(self, run_id: str, repo_path: str, ephemeral: bool = False) -> None:
         """Run one pipeline end-to-end.
 
-        `ephemeral=True` (uploads only, see `start_run_from_zip`) means this
+        `ephemeral=True` (uploads only, see `start_job`) means this
         run's extracted source, workspace temp dir, and knowledge-graph index
         are this run's own private, disposable copies -- all three are torn
         down in `finally` regardless of how the run ends. `ephemeral=False`
@@ -311,13 +223,16 @@ class RunManager:
             await self._store.update(run_id, status="completed")
             await self._record_completed(run_id, repo_path)
             await handler.emit_terminal("completed", "Pipeline run completed.")
+            await job_db.mark_job_complete(run_id, "completed")
         except asyncio.CancelledError:
             await self._store.update(run_id, status="stopped")
             await handler.emit_terminal("stopped", "Pipeline run stopped.")
+            await job_db.mark_job_complete(run_id, "stopped")
             raise
         except Exception as exc:
             await self._store.update(run_id, status="failed", error=str(exc))
             await handler.emit_terminal("failed", f"Pipeline run failed: {exc}")
+            await job_db.mark_job_complete(run_id, "failed")
         finally:
             self._tasks.pop(run_id, None)
             if ephemeral:

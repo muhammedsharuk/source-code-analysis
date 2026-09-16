@@ -1,8 +1,9 @@
-"""Event/DTO models streamed to the frontend.
+"""Job/DTO models used by the job API (see server/app.py) and by the
+step-progress shape published to NATS (see nats_publisher.py / event_handler.py).
 
-These mirror `frontend/src/lib/types.ts` field-for-field (same field names,
-same enums) so the JSON sent over SSE/REST needs no translation on the
-client — the real API client only has to replace `mockApi.ts`'s bodies.
+There is no live-log or job-detail model here anymore: a job's progress is
+published to NATS as it happens, not queried back from this service -- see
+ASDLC_INTEGRATION_PLAN.md.
 """
 
 from typing import Literal, Optional
@@ -12,14 +13,7 @@ from pydantic import BaseModel
 LogLevel = Literal["INFO", "SUCCESS", "DEBUG", "WARN", "ANALYZING", "ERROR"]
 StepStatus = Literal["complete", "active", "pending"]
 StepId = Literal["index", "code-index", "tasks", "docs"]
-ProjectStatus = Literal["active", "complete", "failed"]
-
-
-class LogLine(BaseModel):
-    id: str
-    timestamp: str
-    level: LogLevel
-    message: str
+JobStatusValue = Literal["active", "complete", "failed"]
 
 
 class AnalysisStep(BaseModel):
@@ -30,11 +24,10 @@ class AnalysisStep(BaseModel):
     progress: int
 
 
-class ProjectSummary(BaseModel):
-    id: str
+class JobSummary(BaseModel):
+    job_id: str
     name: str
-    repoUrl: str
-    status: ProjectStatus
+    status: JobStatusValue
 
 
 class FileNode(BaseModel):
