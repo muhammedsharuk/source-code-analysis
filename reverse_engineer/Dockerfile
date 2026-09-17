@@ -33,13 +33,19 @@ RUN apt-get update \
 # Newer versions changed this response format, so upgrading CBM can break
 # the application's graph parsing logic.
 #
-# The Linux AMD64 portable release is used because this Docker image targets
-# the standard Linux AMD64 environment.
+# The Linux portable release matching the build's own architecture is used
+# (amd64 or arm64) -- codebase-memory-mcp publishes both for v0.8.1, and the
+# pinned-format concern above is about the CBM version, not the arch.
 
 ARG CBM_VERSION=0.8.1
-ARG CBM_ARCHIVE=codebase-memory-mcp-linux-amd64-portable.tar.gz
 
-RUN curl -fL \
+RUN case "$(dpkg --print-architecture)" in \
+  amd64) CBM_ARCH=amd64 ;; \
+  arm64) CBM_ARCH=arm64 ;; \
+  *) echo "Unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+  esac \
+  && CBM_ARCHIVE="codebase-memory-mcp-linux-${CBM_ARCH}-portable.tar.gz" \
+  && curl -fL \
   "https://github.com/DeusData/codebase-memory-mcp/releases/download/v${CBM_VERSION}/${CBM_ARCHIVE}" \
   -o /tmp/codebase-memory-mcp.tar.gz \
   && mkdir -p /tmp/codebase-memory-mcp \
