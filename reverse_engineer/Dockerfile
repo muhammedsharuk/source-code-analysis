@@ -2,11 +2,13 @@ FROM python:3.12-slim
 
 # System dependencies
 # curl + ca-certificates are required to download the pinned
-# codebase-memory-mcp release.
+# codebase-memory-mcp release. git is required by utils/git_clone.py to
+# clone a caller-supplied repo URL (the zip-upload path doesn't need it).
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
   curl \
   ca-certificates \
+  git \
   && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------

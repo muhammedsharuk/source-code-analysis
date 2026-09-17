@@ -46,6 +46,7 @@ from .event_handler import EventHandler
 from .history_store import HistoryStore
 from .run_store import RunStore
 from utils.codebase_memory import CodebaseMemoryCLI
+from utils.git_clone import UnsafeCloneError, safe_clone_repo
 from utils.naming import safe_directory_name
 from utils.zip_extract import UnsafeZipError, safe_extract_zip
 
@@ -58,6 +59,12 @@ _UPLOAD_CHUNK_BYTES = 1024 * 1024
 def _derive_name(repo_path: str) -> str:
     cleaned = repo_path.rstrip("/\\")
     return cleaned.replace("\\", "/").split("/")[-1] or "repository"
+
+
+def _log_line(level: str, message: str) -> dict[str, Any]:
+    """Same shape `EventHandler._emit` publishes -- used here directly for the
+    clone step, which happens before an `EventHandler` for this run exists."""
+    return {"id": uuid.uuid4().hex, "timestamp": datetime.now().strftime("%H:%M:%S"), "level": level, "message": message}
 
 
 class RunManager:
@@ -78,8 +85,21 @@ class RunManager:
 
     # --- starting/observing/stopping jobs -----------------------------------
 
-    async def start_job(self, job_id: str | None, name: str, file: UploadFile) -> dict[str, Any]:
-        """Save + safely extract an uploaded repo zip, then run the pipeline against it.
+    async def start_job(
+        self,
+        job_id: str | None,
+        name: str,
+        file: UploadFile | None = None,
+        *,
+        repo_url: str | None = None,
+        git_username: str | None = None,
+        git_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Start a job from either an uploaded repo zip or a repo URL to clone.
+
+        Exactly one of `file` / `repo_url` must be given -- callers validate
+        this at the HTTP layer too (see `app.py`), but it's enforced here
+        again since this is also the direct/manual entry point.
 
         `job_id` is caller-supplied when the caller needs to control it (e.g.
         asdlc-assistant's backend, which addresses this the same way it
@@ -91,35 +111,50 @@ class RunManager:
         per the "treat every upload as one-off" retention decision — see
         `docker-compose.yml`'s absence of an uploads volume, which is
         deliberate: nothing here is meant to survive past its own run.
+
+        A zip's bytes are consumed right here, before returning -- it's a
+        local disk write, fast, and the `UploadFile` needs to be read while
+        this request is still open. A repo clone is different: it's a
+        network call that can take minutes, so it's deferred into the
+        background task itself (`_execute_run`) instead of blocking this
+        response -- the caller gets `job_id` back immediately either way,
+        matching every other job's "trigger it, watch progress over NATS"
+        shape.
         """
+        if bool(file) == bool(repo_url):
+            raise ValueError("Provide exactly one of a zip file upload or a repo_url.")
+
         run_id = job_id or uuid.uuid4().hex
         run_dir = UPLOADS_ROOT / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = run_dir / "upload.zip"
+        extracted_dir = run_dir / "source"
+        clone: dict[str, str | None] | None = None
 
-        try:
-            size = 0
-            with zip_path.open("wb") as out:
-                while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
-                    size += len(chunk)
-                    if size > MAX_UPLOAD_BYTES:
-                        raise ValueError(f"Upload exceeds the {MAX_UPLOAD_BYTES} byte limit.")
-                    out.write(chunk)
-
-            extracted_dir = run_dir / "source"
-            safe_extract_zip(zip_path, extracted_dir)
-        except (ValueError, UnsafeZipError):
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-        finally:
-            # The compressed copy is never needed again once extraction has
-            # either succeeded or failed -- only the extracted tree (or
-            # nothing, on failure) needs to survive this method.
-            zip_path.unlink(missing_ok=True)
+        if file is not None:
+            zip_path = run_dir / "upload.zip"
+            try:
+                size = 0
+                with zip_path.open("wb") as out:
+                    while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            raise ValueError(f"Upload exceeds the {MAX_UPLOAD_BYTES} byte limit.")
+                        out.write(chunk)
+                safe_extract_zip(zip_path, extracted_dir)
+            except (ValueError, UnsafeZipError):
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise
+            finally:
+                # The compressed copy is never needed again once extraction has
+                # either succeeded or failed -- only the extracted tree (or
+                # nothing, on failure) needs to survive this method.
+                zip_path.unlink(missing_ok=True)
+        else:
+            clone = {"repo_url": repo_url, "username": git_username, "token": git_token}
 
         repo_path = str(extracted_dir)
         record = await self._store.create(run_id, repo_path, name)
-        self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path, ephemeral=True))
+        self._tasks[run_id] = asyncio.create_task(self._execute_run(run_id, repo_path, ephemeral=True, clone=clone))
         return {"job_id": run_id, "name": name, "status": "active"}
 
     def stop_run(self, run_id: str) -> bool:
@@ -182,7 +217,9 @@ class RunManager:
 
     # --- execution ----------------------------------------------------------
 
-    async def _execute_run(self, run_id: str, repo_path: str, ephemeral: bool = False) -> None:
+    async def _execute_run(
+        self, run_id: str, repo_path: str, ephemeral: bool = False, clone: dict[str, str | None] | None = None
+    ) -> None:
         """Run one pipeline end-to-end.
 
         `ephemeral=True` (uploads only, see `start_job`) means this
@@ -193,10 +230,33 @@ class RunManager:
         the caller supplied that path and may still need it, or may want to
         re-analyze it later with the graph index intact for a fast
         incremental re-index.
+
+        `clone`, when given (repo-URL jobs only -- see `start_job`), means
+        `repo_path` doesn't exist on disk yet: this method's first job is to
+        clone it there before anything else can run. A clone failure is
+        handled the same as any other run failure below, just with a
+        clearer message than a generic exception would give.
         """
         handler = EventHandler(run_id, self)
 
         try:
+            if clone is not None:
+                await self.publish(run_id, _log_line("INFO", f"Cloning {clone['repo_url']}..."))
+                try:
+                    await asyncio.to_thread(
+                        safe_clone_repo,
+                        clone["repo_url"],
+                        Path(repo_path),
+                        username=clone.get("username"),
+                        token=clone.get("token"),
+                    )
+                except UnsafeCloneError as exc:
+                    await self._store.update(run_id, status="failed", error=str(exc))
+                    await handler.emit_terminal("failed", f"Could not clone repository: {exc}")
+                    await job_db.mark_job_complete(run_id, "failed")
+                    return
+                await self.publish(run_id, _log_line("SUCCESS", "Repository cloned."))
+
             orchestrator = create_orchestrator_agent(repo_path)
             # LangGraph's default recursion_limit (25 *graph steps*, not tool
             # calls or batches) is nowhere near enough here — this pipeline

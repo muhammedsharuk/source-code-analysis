@@ -20,6 +20,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
+from utils.git_clone import UnsafeCloneError
 from utils.zip_extract import UnsafeZipError
 
 from .events import FileNode, JobSummary
@@ -50,23 +51,35 @@ app.add_middleware(
 async def start_job(
     name: str = Form(...),
     job_id: str | None = Form(None),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    repo_url: str | None = Form(None),
+    git_username: str | None = Form(None),
+    git_token: str | None = Form(None),
 ) -> JobSummary:
-    """Trigger the pipeline: extracts the uploaded zip and runs it in the background.
+    """Trigger the pipeline: from an uploaded zip, or a repo URL to clone,
+    and runs it in the background.
 
     `job_id` is optional -- a caller that needs to control the id itself
     (e.g. asdlc-assistant's backend, which already generated a Postgres row
     for this job before calling here) passes one, so this service's
     internal run id matches the caller's own record; omit it to have one
     generated here for direct/manual use of this API.
+
+    Exactly one of `file` / `repo_url` is required. `git_username`/`git_token`
+    are only meaningful with `repo_url`, for a private repository -- see
+    `utils/git_clone.py` for how they're used and discarded.
     """
-    if not file.filename or not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip uploads are supported.")
     if not name.strip():
         raise HTTPException(status_code=400, detail="name is required.")
+    if bool(file) == bool(repo_url):
+        raise HTTPException(status_code=400, detail="Provide exactly one of a zip file upload or a repo_url.")
+    if file is not None and (not file.filename or not file.filename.lower().endswith(".zip")):
+        raise HTTPException(status_code=400, detail="Only .zip uploads are supported.")
     try:
-        record = await run_manager.start_job(job_id, name.strip(), file)
-    except (ValueError, UnsafeZipError) as exc:
+        record = await run_manager.start_job(
+            job_id, name.strip(), file, repo_url=repo_url, git_username=git_username, git_token=git_token
+        )
+    except (ValueError, UnsafeZipError, UnsafeCloneError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JobSummary(**record)
 
