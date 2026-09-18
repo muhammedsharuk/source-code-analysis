@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 LogLevel = Literal["INFO", "SUCCESS", "DEBUG", "WARN", "ANALYZING", "ERROR"]
 StepStatus = Literal["complete", "active", "pending"]
-StepId = Literal["index", "code-index", "tasks", "docs"]
+StepId = Literal["index", "code-index", "tasks", "docs", "graph"]
 JobStatusValue = Literal["active", "complete", "failed"]
 
 
@@ -38,11 +38,14 @@ class FileNode(BaseModel):
 
 
 def default_steps() -> list[AnalysisStep]:
-    """The 4 macro-steps `ExecutionPage` renders, all starting pending.
+    """The 5 macro-steps `ExecutionPage` renders, all starting pending.
 
     These collapse the orchestrator prompt's 9 pipeline stages: `index` is
     Stage 1, `code-index` is Stage 2, `tasks` is Stage 3, and `docs` covers
-    Stages 5-9 (user stories, features, epics, architecture).
+    Stages 5-9 (user stories, features, epics, architecture). `graph` isn't
+    an orchestrator stage at all -- it's `RunManager._snapshot_graph`,
+    capturing the call graph for the Graph tab after the orchestrator's own
+    run finishes, while its codebase-memory index still exists.
     """
     return [
         AnalysisStep(
@@ -70,6 +73,13 @@ def default_steps() -> list[AnalysisStep]:
             id="docs",
             label="Generating Documentation",
             description="User stories, features, epics, and architecture overview.",
+            status="pending",
+            progress=0,
+        ),
+        AnalysisStep(
+            id="graph",
+            label="Capturing Call Graph",
+            description="Snapshotting the function call graph for the Graph view.",
             status="pending",
             progress=0,
         ),

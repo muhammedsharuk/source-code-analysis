@@ -435,6 +435,14 @@ class EventHandler:
                 break
         await self._run_manager.publish_steps(self._run_id, self._steps)
 
+    async def set_step(self, step_id: str, status: str, progress: int) -> None:
+        """Public entry point for step updates that don't come from an `astream_events`
+        tool event -- currently just `RunManager._snapshot_graph`'s "graph" step, which
+        runs after the orchestrator's own run (and this handler's event loop) has already
+        finished, so it updates the same `self._steps` this handler already owns instead of
+        duplicating step-tracking state in `RunManager`."""
+        await self._set_step_status(step_id, status, progress)
+
     async def _emit(self, level: LogLevel, message: str) -> None:
         line = {"id": uuid.uuid4().hex, "timestamp": _now_hms(), "level": level, "message": message}
         await self._run_manager.publish(self._run_id, line)

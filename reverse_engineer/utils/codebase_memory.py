@@ -1,6 +1,7 @@
 import json
 import subprocess
 import time
+from typing import Any
 
 class CodebaseMemoryCLI:
     def __init__(
@@ -13,7 +14,7 @@ class CodebaseMemoryCLI:
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds
 
-    def _run(self, command: str, **options):
+    def _run(self, command: str, timeout_seconds: float | None = None, **options):
         payload = {
             k: v
             for k, v in options.items()
@@ -33,11 +34,29 @@ class CodebaseMemoryCLI:
         for attempt in range(1, self.max_retries + 2):
             print("Running:", cmd, f"(attempt {attempt})" if attempt > 1 else "")
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                # Same "transient, usually concurrent access to the knowledge graph
+                # store" cause as the empty-stdout case below can produce an outright
+                # hang instead of an empty response -- retry rather than propagate
+                # immediately, but only up to `max_retries`, same as every other
+                # retryable failure here, so a caller with a `timeout_seconds` bound
+                # still gets a bounded total wait rather than an unbounded one.
+                last_error = RuntimeError(
+                    f"'{command}' did not respond within {timeout_seconds}s. This is usually "
+                    "a transient issue (e.g. concurrent access to the knowledge graph store "
+                    "from another still-running codebase-memory-mcp session) rather than a "
+                    "real failure."
+                )
+                if attempt <= self.max_retries:
+                    time.sleep(self.retry_delay_seconds)
+                continue
 
             if result.returncode != 0:
                 raise RuntimeError(
@@ -69,6 +88,22 @@ class CodebaseMemoryCLI:
         assert last_error is not None
         raise last_error
 
+    @staticmethod
+    def unwrap(result: dict) -> Any:
+        """Unwrap an MCP tool result's `{"content": [{"type": "text", "text": "<json>"}]}`
+        envelope into its parsed payload.
+
+        The tools in `tools/codebase_memory_tools.py` return this envelope as-is, since the
+        deep agent framework passes it straight to the LLM, which reads `text` itself. Any
+        caller that isn't an LLM (e.g. a backend job that wants the parsed graph data) needs
+        this instead.
+        """
+        content = result.get("content") or []
+        if not content:
+            return None
+        text = content[0].get("text", "")
+        return json.loads(text) if text else None
+
     def index_repository(
         self,
         repo_path: str,
@@ -92,13 +127,22 @@ class CodebaseMemoryCLI:
     def delete_project(
         self,
         project: str,
+        timeout_seconds: float | None = None,
     ):
         """
         Delete an indexed project.
+
+        Unlike the read-only calls above, this one is routinely invoked right
+        after the orchestrator's own long-lived session for the same project
+        has just finished (see `RunManager._cleanup_ephemeral_run`) -- that
+        session may still be releasing its lock on the graph store, so this
+        call needs the same bounded-wait treatment as `get_architecture`/
+        `query_graph` instead of blocking forever.
         """
 
         return self._run(
             "delete_project",
+            timeout_seconds=timeout_seconds,
             project=project,
         )
 
@@ -126,9 +170,11 @@ class CodebaseMemoryCLI:
         project: str,
         path: str | None = None,
         aspects: list[str] | None = None,
+        timeout_seconds: float | None = None,
     ):
         return self._run(
             "get_architecture",
+            timeout_seconds=timeout_seconds,
             project=project,
             path=path,
             aspects=json.dumps(aspects) if aspects else None,
@@ -209,9 +255,11 @@ class CodebaseMemoryCLI:
         query: str,
         graph: str = "code",
         max_rows: int | None = None,
+        timeout_seconds: float | None = None,
     ):
         return self._run(
             "query_graph",
+            timeout_seconds=timeout_seconds,
             project=project,
             query=query,
             graph=graph,

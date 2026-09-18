@@ -13,6 +13,7 @@ resolving the same way they do for `main.py`).
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -93,6 +94,23 @@ async def get_job_files(job_id: str) -> list[FileNode]:
     if not children:
         return []
     return [FileNode(name="output", path="output", type="folder", children=children)]
+
+
+@app.get("/jobs/{job_id}/graph")
+async def get_job_graph(job_id: str) -> dict:
+    """The call graph captured for this job -- see `RunManager._snapshot_graph`.
+
+    Only present once the run has completed: the snapshot is written at
+    the same point `output/<project>/*.md` is, and a run that's still in
+    progress, failed, or never produced one has no `graph.json` to read.
+    """
+    output_dir = await run_manager.output_dir_for(job_id)
+    if output_dir is None:
+        raise HTTPException(status_code=404, detail="No output yet for this job.")
+    graph_path = output_dir / "graph.json"
+    if not graph_path.is_file():
+        raise HTTPException(status_code=404, detail="No call graph was captured for this job.")
+    return json.loads(graph_path.read_text(encoding="utf-8"))
 
 
 @app.get("/jobs/{job_id}/files/content")

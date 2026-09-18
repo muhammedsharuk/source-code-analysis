@@ -31,6 +31,7 @@ last-known status stuck at `"running"` forever.
 """
 
 import asyncio
+import json
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -54,6 +55,13 @@ _REVERSE_ENGINEER_ROOT = Path(__file__).resolve().parent.parent
 UPLOADS_ROOT = _REVERSE_ENGINEER_ROOT / "uploads"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # keep in step with zip_extract.MAX_UNCOMPRESSED_BYTES
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# Bounds for `_snapshot_graph`'s codebase-memory calls, which run against an index that's
+# just been used (and may still be held open) by the orchestrator's own codebase-memory-mcp
+# session -- generous enough for a metadata/Cypher query plus retries under lock contention,
+# but never unbounded, so a stuck subprocess can't hang the run's "completed" event forever.
+_CALL_TIMEOUT_SECONDS = 45.0
+_GRAPH_TIMEOUT_SECONDS = 200.0  # covers all 3 calls above sequentially, plus buffer
 
 
 def _derive_name(repo_path: str) -> str:
@@ -281,7 +289,7 @@ class RunManager:
                 await handler.handle_event(event)
 
             await self._store.update(run_id, status="completed")
-            await self._record_completed(run_id, repo_path)
+            await self._record_completed(run_id, repo_path, handler)
             await handler.emit_terminal("completed", "Pipeline run completed.")
             await job_db.mark_job_complete(run_id, "completed")
         except asyncio.CancelledError:
@@ -314,7 +322,13 @@ class RunManager:
             shutil.rmtree(workspace_dir, ignore_errors=True)
             if project_name:
                 try:
-                    CodebaseMemoryCLI().delete_project(project=project_name)
+                    # Bounded, same as `_snapshot_graph`'s calls just above -- without
+                    # this, a lock still held by the orchestrator's own just-finished
+                    # codebase-memory-mcp session makes `subprocess.run` block forever
+                    # (see `CodebaseMemoryCLI.delete_project`), silently hanging this
+                    # whole background task and leaving the job stuck at "active"
+                    # forever, since nothing after this line ever runs.
+                    CodebaseMemoryCLI().delete_project(project=project_name, timeout_seconds=_CALL_TIMEOUT_SECONDS)
                 except Exception:
                     # Best-effort: a stray/partial knowledge-graph index left
                     # behind is a disk-space nuisance, never a reason to mask
@@ -323,7 +337,7 @@ class RunManager:
 
         await asyncio.to_thread(_cleanup)
 
-    async def _record_completed(self, run_id: str, repo_path: str) -> None:
+    async def _record_completed(self, run_id: str, repo_path: str, handler: EventHandler) -> None:
         """Write this run's one-time, permanent history record.
 
         Called exactly once, only from the success branch above — never on
@@ -344,6 +358,168 @@ class RunManager:
                 "output_dir": str(output_dir),
             }
         )
+
+        # Capture the call graph now, while this run's codebase-memory index
+        # still exists -- `_cleanup_ephemeral_run` deletes that index
+        # unconditionally once `_execute_run`'s `finally` block runs right
+        # after this method returns, so `graph.json` is the only place a
+        # call graph survives past this run. Best-effort in every sense: a
+        # failure or a timeout here never affects the run's own
+        # already-recorded outcome, and `_execute_run`'s "completed" event
+        # (see `_GRAPH_TIMEOUT_SECONDS` above) always still fires -- without
+        # that bound, a hang here (e.g. the orchestrator's own
+        # codebase-memory-mcp session still holding the index open, causing
+        # the fresh CLI calls below to contend for it) would silently swallow
+        # the run's completion instead of just this one step.
+        project_name = (record or {}).get("project_name")
+        if project_name:
+            await handler.set_step("graph", "active", 0)
+            await self.publish(run_id, _log_line("INFO", "Capturing the call graph for the Graph view..."))
+            try:
+                counts = await asyncio.wait_for(self._snapshot_graph(output_dir, project_name), timeout=_GRAPH_TIMEOUT_SECONDS)
+                await self.publish(
+                    run_id,
+                    _log_line(
+                        "SUCCESS",
+                        f"Call graph ready — {counts['functions']} functions, {counts['calls']} calls across "
+                        f"{counts['packages']} packages.",
+                    ),
+                )
+            except asyncio.TimeoutError:
+                await self.publish(
+                    run_id,
+                    _log_line("WARNING", f"Call graph capture timed out after {_GRAPH_TIMEOUT_SECONDS}s — the Graph view will be empty for this run."),
+                )
+            except Exception as exc:
+                await self.publish(run_id, _log_line("WARNING", f"Could not capture call graph: {exc}"))
+            # Always complete the step, success or not -- this is the run's very last
+            # step, so leaving it "active" on a failure would leave the progress bar
+            # stuck forever instead of reflecting that the run itself is done.
+            await handler.set_step("graph", "complete", 100)
+
+    async def _snapshot_graph(self, output_dir: Path, project_name: str) -> dict[str, int]:
+        """Write `graph.json` and return its node/edge counts for the caller to log.
+
+        Package-level overview from `get_architecture` (already deduped and
+        weighted by that tool) plus a function-level call graph from
+        `query_graph` (the only tool that returns real `(source, target)`
+        edge pairs rather than per-node degree counts or hop-distance
+        traces).
+
+        Node ids are `qualified_name`, not the bare `name` -- this indexer
+        reuses bare names across files/components routinely (two
+        `isValidEmail`s, two `validateForm`s, etc. are common even in a small
+        repo), so `name` is only safe to use as a display label.
+
+        The `MATCH (a:Function)-[:CALLS]->(b:Function)` shape only matches
+        edges where both ends already resolved to a `Function` node, which is
+        what keeps unresolved call targets out of the snapshot for free --
+        no separate filtering step needed.
+
+        Each call below gets its own `timeout_seconds` bound -- see
+        `CodebaseMemoryCLI._run` -- so a stuck subprocess can't hang this
+        method forever; `asyncio.wait_for` at the call site above is the
+        second, outer bound covering the whole method plus thread scheduling.
+        """
+
+        def _build() -> dict[str, Any]:
+            cli = CodebaseMemoryCLI()
+            architecture = cli.unwrap(cli.get_architecture(project=project_name, aspects=["all"], timeout_seconds=_CALL_TIMEOUT_SECONDS)) or {}
+            node_rows = cli.unwrap(
+                cli.query_graph(
+                    project=project_name,
+                    query=(
+                        "MATCH (f:Function) RETURN f.qualified_name AS id, f.name AS name, "
+                        "f.file_path AS file_path, f.start_line AS start_line, f.end_line AS end_line, "
+                        "f.is_entry_point AS is_entry_point"
+                    ),
+                    timeout_seconds=_CALL_TIMEOUT_SECONDS,
+                )
+            ) or {}
+            edge_rows = cli.unwrap(
+                cli.query_graph(
+                    project=project_name,
+                    query=(
+                        "MATCH (a:Function)-[r:CALLS]->(b:Function) RETURN DISTINCT "
+                        "a.qualified_name AS source, b.qualified_name AS target, count(r) AS weight"
+                    ),
+                    timeout_seconds=_CALL_TIMEOUT_SECONDS,
+                )
+            ) or {}
+
+            def _rows_to_dicts(result: dict[str, Any]) -> list[dict[str, Any]]:
+                columns = result.get("columns") or []
+                return [dict(zip(columns, row)) for row in result.get("rows") or []]
+
+            # `query_graph` renders every property as a string (e.g. `"start_line": "11"`,
+            # `"is_entry_point": "false"`) -- coerce back to the real types here, once, so
+            # nothing downstream has to re-parse them (and never `bool("false")`, which is
+            # `True`: it's a non-empty string).
+            function_nodes = _rows_to_dicts(node_rows)
+            for node in function_nodes:
+                node["start_line"] = int(node["start_line"])
+                node["end_line"] = int(node["end_line"])
+                node["is_entry_point"] = node["is_entry_point"] == "true"
+
+            function_edges = _rows_to_dicts(edge_rows)
+            for edge in function_edges:
+                edge["weight"] = int(edge["weight"])
+
+            # `architecture["packages"]` and `architecture["boundaries"]` aren't always the
+            # same namespace. Confirmed against a real small FastAPI project: `packages`
+            # held only its 5 *external* pip dependencies (bcrypt, fastapi, ...), each with
+            # fan_in=fan_out=0, while `boundaries` used its own internal module names
+            # (main, crud, database, security, models) as endpoints -- names that never
+            # appear in `packages` at all. Building nodes from `packages` alone and edges
+            # from `boundaries` alone (the original approach) left every boundary edge
+            # pointing at a node id that didn't exist, so dagre's `g.hasNode(...)` guard
+            # silently dropped all of them client-side: 5 disconnected package boxes, 0
+            # visible calls, even though the underlying function-level graph was correct.
+            # Union both name sets so every boundary edge always has a matching node,
+            # regardless of which naming scheme a given project's `packages` happens to
+            # use; `layers` (same namespace as `boundaries`) fills in a node's `layer`
+            # classification when `packages` didn't cover it.
+            package_by_name = {p["name"]: p for p in architecture.get("packages", []) if p.get("name")}
+            layer_by_name = {l["name"]: l for l in architecture.get("layers", []) if l.get("name")}
+            boundaries = [b for b in architecture.get("boundaries", []) if b.get("from") and b.get("to")]
+            boundary_names = {b["from"] for b in boundaries} | {b["to"] for b in boundaries}
+
+            package_nodes = [
+                {
+                    "id": name,
+                    "name": name,
+                    "node_count": package_by_name.get(name, {}).get("node_count", 0),
+                    "fan_in": package_by_name.get(name, {}).get("fan_in", 0),
+                    "fan_out": package_by_name.get(name, {}).get("fan_out", 0),
+                    "layer": layer_by_name.get(name, {}).get("layer"),
+                }
+                for name in package_by_name.keys() | boundary_names
+            ]
+
+            return {
+                "project": project_name,
+                "packages": {
+                    "nodes": package_nodes,
+                    "edges": [{"source": b["from"], "target": b["to"], "weight": b["call_count"]} for b in boundaries],
+                },
+                "functions": {
+                    "nodes": function_nodes,
+                    "edges": function_edges,
+                },
+            }
+
+        graph = await asyncio.to_thread(_build)
+
+        def _write() -> None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+        await asyncio.to_thread(_write)
+        return {
+            "functions": len(graph["functions"]["nodes"]),
+            "calls": len(graph["functions"]["edges"]),
+            "packages": len(graph["packages"]["nodes"]),
+        }
 
 
 run_manager = RunManager()
