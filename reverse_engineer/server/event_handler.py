@@ -437,7 +437,7 @@ class EventHandler:
 
     async def set_step(self, step_id: str, status: str, progress: int) -> None:
         """Public entry point for step updates that don't come from an `astream_events`
-        tool event -- currently just `RunManager._snapshot_graph`'s "graph" step, which
+        tool event -- currently just `RunManager._record_completed`'s "graph" step, which
         runs after the orchestrator's own run (and this handler's event loop) has already
         finished, so it updates the same `self._steps` this handler already owns instead of
         duplicating step-tracking state in `RunManager`."""

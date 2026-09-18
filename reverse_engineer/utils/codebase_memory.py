@@ -28,7 +28,9 @@ class CodebaseMemoryCLI:
             json.dumps(payload),
             "--json",
         ]
+        return self._run_subprocess(cmd, command, timeout_seconds)
 
+    def _run_subprocess(self, cmd: list[str], command: str, timeout_seconds: float | None):
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 2):
@@ -170,6 +172,7 @@ class CodebaseMemoryCLI:
         project: str,
         path: str | None = None,
         aspects: list[str] | None = None,
+        format: str | None = None,
         timeout_seconds: float | None = None,
     ):
         return self._run(
@@ -177,7 +180,16 @@ class CodebaseMemoryCLI:
             timeout_seconds=timeout_seconds,
             project=project,
             path=path,
-            aspects=json.dumps(aspects) if aspects else None,
+            # Passed through as the real list, NOT `json.dumps(aspects)` -- `_run`'s own
+            # `json.dumps(payload)` already encodes it once; double-encoding it into a
+            # string here used to be silently tolerated by an older codebase-memory-mcp
+            # CLI parser, but 0.11.0's is stricter: a stringified array is an unrecognized
+            # `aspects` value, so it silently falls back to the default summary view
+            # instead of "all" -- confirmed directly: `compute_graph`'s `packages`/
+            # `boundaries`/`layers` all came back empty/absent with the old encoding,
+            # correct with this one.
+            aspects=aspects,
+            format=format,
         )
 
 
@@ -255,6 +267,7 @@ class CodebaseMemoryCLI:
         query: str,
         graph: str = "code",
         max_rows: int | None = None,
+        format: str | None = None,
         timeout_seconds: float | None = None,
     ):
         return self._run(
@@ -264,13 +277,16 @@ class CodebaseMemoryCLI:
             query=query,
             graph=graph,
             max_rows=max_rows,
+            format=format,
         )
 
 
-    def get_graph_schema(self, project: str):
+    def get_graph_schema(self, project: str, format: str | None = None, timeout_seconds: float | None = None):
         return self._run(
             "get_graph_schema",
+            timeout_seconds=timeout_seconds,
             project=project,
+            format=format,
         )
 
 

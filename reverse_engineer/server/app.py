@@ -98,19 +98,35 @@ async def get_job_files(job_id: str) -> list[FileNode]:
 
 @app.get("/jobs/{job_id}/graph")
 async def get_job_graph(job_id: str) -> dict:
-    """The call graph captured for this job -- see `RunManager._snapshot_graph`.
+    """The call graph for this job's project.
 
-    Only present once the run has completed: the snapshot is written at
-    the same point `output/<project>/*.md` is, and a run that's still in
-    progress, failed, or never produced one has no `graph.json` to read.
+    Fast path: `RunManager._record_completed` already computed this once, right
+    after the run finished, and cached it to `output/<project>/graph.json` -- read
+    that straight off disk when it's there, which is the common case for any job that
+    finished after this cache existed.
+
+    Fallback: if that file is missing (the run predates this cache, or the one-time
+    capture failed/timed out -- best-effort, see `_record_completed`), fall back to
+    computing it live via `RunManager.compute_graph`. Slower (that method runs a real
+    physics simulation, not a metadata lookup), but still works for any job that got
+    far enough to index the repository at all, regardless of whether the pipeline
+    itself went on to complete, fail, or get stopped.
     """
     output_dir = await run_manager.output_dir_for(job_id)
-    if output_dir is None:
-        raise HTTPException(status_code=404, detail="No output yet for this job.")
-    graph_path = output_dir / "graph.json"
-    if not graph_path.is_file():
-        raise HTTPException(status_code=404, detail="No call graph was captured for this job.")
-    return json.loads(graph_path.read_text(encoding="utf-8"))
+    if output_dir is not None:
+        graph_path = output_dir / "graph.json"
+        if graph_path.is_file():
+            return json.loads(graph_path.read_text(encoding="utf-8"))
+
+    project_name = await run_manager.project_name_for(job_id)
+    if not project_name:
+        raise HTTPException(status_code=404, detail="No indexed project found for this job.")
+    try:
+        return await run_manager.compute_graph(project_name)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Timed out computing the call graph.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Could not compute the call graph: {exc}") from exc
 
 
 @app.get("/jobs/{job_id}/files/content")

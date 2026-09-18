@@ -43,9 +43,12 @@ def default_steps() -> list[AnalysisStep]:
     These collapse the orchestrator prompt's 9 pipeline stages: `index` is
     Stage 1, `code-index` is Stage 2, `tasks` is Stage 3, and `docs` covers
     Stages 5-9 (user stories, features, epics, architecture). `graph` isn't
-    an orchestrator stage at all -- it's `RunManager._snapshot_graph`,
-    capturing the call graph for the Graph tab after the orchestrator's own
-    run finishes, while its codebase-memory index still exists.
+    an orchestrator stage at all -- it's `RunManager.compute_graph` running
+    once, right after the orchestrator's own run finishes (while its
+    codebase-memory index is still guaranteed fresh), with the result cached
+    to disk so opening the Graph tab is a file read, not a ~1-30s recompute
+    (the physics simulation in `utils/layout3d.py` isn't free) -- see
+    `RunManager._record_completed` and `app.py`'s `/jobs/{job_id}/graph`.
     """
     return [
         AnalysisStep(
@@ -79,7 +82,7 @@ def default_steps() -> list[AnalysisStep]:
         AnalysisStep(
             id="graph",
             label="Capturing Call Graph",
-            description="Snapshotting the function call graph for the Graph view.",
+            description="Laying out the call graph in 3D for the Graph view.",
             status="pending",
             progress=0,
         ),
