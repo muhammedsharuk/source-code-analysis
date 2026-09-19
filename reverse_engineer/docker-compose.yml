@@ -14,6 +14,10 @@ services:
       # Wherever the repos REPO_PATH/start_analysis will point at actually
       # live -- adjust the host side to your own repo storage location.
       - ./repos:/repos:ro
+      # Completed-run history (job_id -> project/output_dir mapping) --
+      # without this, a rebuild wipes it and previously finished runs
+      # become unbrowsable even though their output/ files still exist.
+      - ./server/runs:/app/server/runs
 
 volumes:
   cbm-cache:
